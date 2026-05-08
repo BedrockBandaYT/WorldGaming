@@ -1,0 +1,50 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+
+  --color-brand: #10b981;
+  --color-brand-foreground: #ffffff;
+  
+  --radius-xl: 1rem;
+  --radius-2xl: 1.5rem;
+
+  --color-nexus-bg-primary: #0F1115;
+  --color-nexus-bg-secondary: #0A0C10;
+  --color-nexus-surface: #15181F;
+  --color-nexus-border: #2A2D35;
+  --color-nexus-text: #E4E6EB;
+}
+
+@layer base {
+  body {
+    @apply bg-[family-name:--color-nexus-bg-primary] text-[family-name:--color-nexus-text] antialiased selection:bg-emerald-500/30 selection:text-emerald-200;
+  }
+
+  h1, h2, h3, h4 {
+    @apply tracking-tighter font-bold;
+  }
+}
+
+.glass {
+  @apply bg-[#15181F]/80 backdrop-blur-xl border border-[#2A2D35] shadow-2xl;
+}
+
+.bet-card {
+  @apply transition-all duration-300 hover:scale-[1.01] active:scale-[0.99] cursor-pointer relative overflow-hidden bg-[#15181F] border border-[#2A2D35];
+}
+
+/* Custom Scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  @apply bg-[#0F1115];
+}
+::-webkit-scrollbar-thumb {
+  @apply bg-[#2A2D35] rounded-full hover:bg-[#3F434C] transition-colors;
+}
+

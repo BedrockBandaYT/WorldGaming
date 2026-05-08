@@ -1,0 +1,15 @@
+name = "worldgaming-api"
+main = "src/index.ts"
+compatibility_date = "2026-05-08"
+workers_dev = true
+
+[vars]
+APP_ENV = "production"
+
+[[kv_namespaces]]
+binding = "SESSIONS"
+id = "__REPLACE_WITH_SESSIONS_KV_ID__"
+
+[[kv_namespaces]]
+binding = "SUSPENDED_MARKETS"
+id = "__REPLACE_WITH_SUSPENDED_MARKETS_KV_ID__"

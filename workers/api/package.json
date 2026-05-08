@@ -1,0 +1,22 @@
+{
+  "name": "@worldgaming/api-worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "lint": "echo 'lint not configured'",
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev --local"
+  },
+  "dependencies": {
+    "hono": "^4.7.10",
+    "zod": "^3.23.8",
+    "@hono/zod-validator": "^0.4.3"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.3",
+    "@cloudflare/workers-types": "^4.20260502.0",
+    "wrangler": "^4.14.1"
+  }
+}

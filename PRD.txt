@@ -1,0 +1,1232 @@
+# PRODUCT REQUIREMENTS DOCUMENT
+## WorldGaming
+### Production-grade sports betting platform on Cloudflare edge infrastructure
+**Phase 1 — Core Platform · Version 1.0 · May 2026 · Codex-Refined Edition**
+
+> **CODEX USAGE GUIDE — READ BEFORE GENERATING CODE**
+>
+> This document is optimised for use as primary context when generating the WorldGaming codebase
+> with an AI coding assistant (Claude Code, GitHub Copilot, Cursor, or OpenAI Codex).
+>
+> **How to feed this document:**
+> - Pass the entire PRD as system context before asking for any file generation.
+> - Always request one file at a time, naming the target path explicitly.
+> - Reference section numbers (e.g. "implement §8 walletService.ts") for precision.
+>
+> **Priority tiers used throughout this document:**
+> - `[P0]` — Must be implemented before any user can place a bet. Ship-blocker.
+> - `[P1]` — Required for Phase 1 launch. Must ship before go-live.
+> - `[P2]` — Important but can follow in a fast-follow release (< 2 weeks post-launch).
+>
+> **Generation conventions to enforce in every prompt:**
+> - All TypeScript — strict mode, `"noUncheckedIndexedAccess": true`.
+> - All Cloudflare Workers ES module format (`export default { fetch, queue, scheduled }`).
+> - All Hono routes use `@hono/zod-validator` middleware — never trust raw `c.req.json()`.
+> - All wallet mutations MUST go through `walletService.credit()` / `walletService.debit()` — never raw SQL.
+> - All admin actions MUST call `auditService.logAction()` before returning a response.
+> - KV suspension flag read (`SUSPENDED_MARKETS`) MUST be first DB-adjacent call in bet pipeline.
+> - Never use `console.error` — always `Sentry.captureException(err, { extra: { requestId } })`.
+>
+> **File path conventions (monorepo root = `worldgaming/`):**
+> ```
+> workers/api/src/          → API Worker (Hono)
+> workers/websocket/src/    → WebSocket routing Worker
+> workers/feed/src/         → Feed Ingestion Worker
+> workers/settlement/src/   → Settlement queue consumer
+> workers/fraud/src/        → Fraud analysis queue consumer
+> workers/audit/src/        → Audit log queue consumer
+> workers/durable-objects/src/ → All DO class implementations
+> apps/web/src/             → User-facing React SPA
+> apps/admin/src/           → Admin SPA (/sgyt)
+> packages/types/           → Shared TypeScript interfaces
+> infra/wrangler/           → wrangler.toml configs
+> infra/terraform/          → WAF + KV Terraform
+> ```
+>
+> **Secrets — never hardcode, always bind via Cloudflare Workers Secrets:**
+> `PLANETSCALE_DATABASE_URL`, `INTERNAL_SECRET`, `ENTITYSPORT_API_KEY`,
+> `ENTITYSPORT_WEBHOOK_SECRET`, `SPORTMONKS_API_KEY`, `SPORTMONKS_WEBHOOK_SECRET`,
+> `APISPORTS_API_KEY`, `SENTRY_DSN`, `TELEGRAM_ALERT_BOT_TOKEN`, `TELEGRAM_ALERT_CHAT_ID`
+
+---
+
+## WorldGaming
+### Production-grade sports betting platform on Cloudflare edge infrastructure
+**Phase 1 — Core Platform · Version 1.0 · May 2026**
+
+---
+
+## DOCUMENT INFORMATION
+
+| Field | Detail |
+|---|---|
+| **Product Name** | WorldGaming |
+| **Document Type** | Product Requirements Document (PRD) — Codex-Refined Edition |
+| **Version** | 1.0 — Initial release |
+| **Phase** | Phase 1 — Core Platform |
+| **Status** | Draft |
+| **Date** | May 2026 |
+| **Author** | SlayerGamerYT / Product Lead |
+| **Target Market** | Primary: South Asia (IN) — Secondary: GB, MT (regulated expansion) |
+| **Key Changes This Version** | N/A — v1.0 initial document |
+
+---
+
+## TABLE OF CONTENTS
+
+| # | Section |
+|---|---|
+| 1 | Executive Summary |
+| 2 | Product Vision and Goals |
+| 3 | Target Users and Personas |
+| 4 | Market Context and Competitive Positioning |
+| 5 | Scope — Phase 1 In / Out |
+| 6 | Feature Requirements — Betting Platform (User Frontend) |
+| 7 | Feature Requirements — Realtime & Live Match Engine |
+| 8 | Feature Requirements — Wallet & Ledger System |
+| 9 | Feature Requirements — Admin Panel (/sgyt) |
+| 10 | Feature Requirements — Risk & Fraud Engine |
+| 11 | Screen Inventory |
+| 12 | Key User Flows |
+| 13 | Strategic Differentiators |
+| 14 | User Stories by Persona |
+| 15 | Functional Requirements Summary |
+| 16 | Non-Functional Requirements |
+| 17 | Assumptions and Dependencies |
+| 18 | Success Metrics and KPIs |
+| 19 | Out of Scope — Phase 2 Roadmap |
+| 20 | Open Questions and Decisions |
+| 21 | Glossary |
+| 22 | Document Sign-Off |
+
+---
+
+## 1 — EXECUTIVE SUMMARY
+
+WorldGaming is a production-grade sports betting platform built entirely on Cloudflare's edge infrastructure, designed for operators running private books across Cricket, Football, Tennis, and Volleyball. It is purpose-built for markets where near-zero latency odds delivery, granular per-user risk controls, and instant account administration are not optional — they are the baseline expectation of every serious player.
+
+The current sportsbook software market is dominated by white-label solutions that were architected for centralized server deployments, not edge compute. Platforms such as BetConstruct, EveryMatrix, and SBTech carry the structural debt of traditional three-tier web applications: centralized WebSocket hubs that become bottlenecks during live match spikes, database architectures that cannot handle concurrent high-volume bet placement without queueing delays, and admin panels that rely on role hierarchies too rigid for agent-based operator models. None of these platforms are deployable on Cloudflare Workers natively — they require dedicated VMs, load balancers, and regional databases that add cost, complexity, and latency.
+
+Phase 1 of WorldGaming delivers five production-ready modules: the User Betting Frontend, the Realtime Live Match Engine, the Wallet and Ledger System, the Admin Panel at `/sgyt`, and the Risk and Fraud Engine. This scope proves the core value proposition — sub-50ms odds delivery to any user globally via Cloudflare Durable Objects, backend-only session authentication with instant account revocation, and a double-entry ledger that maintains financial integrity at any concurrency level. Payment gateway integration, self-service registration, and advanced analytics dashboards are deliberately deferred to Phase 2 so the engineering team can validate the realtime infrastructure under live match load before adding complexity.
+
+### Phase 1 at a Glance
+
+| Area | Specification | Notes |
+|---|---|---|
+| **Modules** | 5 core modules | Betting Frontend, Realtime Engine, Wallet & Ledger, Admin Panel, Risk & Fraud Engine |
+| **User Roles** | 5 permission levels | Super Admin → Senior Admin → Agent → Read-Only Admin → User |
+| **Platform** | Web (React SPA) | Mobile-responsive; native mobile app deferred to Phase 2 |
+| **Key Differentiator 1** | Cloudflare Durable Objects WebSocket hub | Per-match singleton DO; sub-50ms broadcast to all connected clients |
+| **Key Differentiator 2** | Backend-only opaque session auth | HttpOnly cookies + KV sessions; instant revocation on user ban |
+| **Key Differentiator 3** | Admin-provisioned accounts only | No self-registration; complete operator control over user base |
+| **Deferred** | Payment gateway, native mobile app, self-service registration | Phase 2 after infrastructure validation |
+
+---
+
+## 2 — PRODUCT VISION AND GOALS
+
+### 2.1 Vision Statement
+
+WorldGaming is the edge-native operating system for private sportsbook operators — a single platform where admins create accounts, set limits, manage odds, and settle markets without touching a server.
+
+### 2.2 Mission
+
+WorldGaming gives sportsbook operators complete control over their user base, markets, and financial exposure through a Cloudflare-native stack that eliminates infrastructure management, delivers live odds in under 50ms globally, and enforces risk rules at the API layer before a single rupee changes hands.
+
+### 2.3 Core Product Goals
+
+- **Deliver sub-50ms odds to every connected client** — leverage Cloudflare Durable Objects as per-match WebSocket hubs broadcasting updates to all subscribers simultaneously, with zero additional infrastructure.
+- **Enforce zero-trust session security** — store all session state in Cloudflare KV as opaque tokens; enable admin-triggered instant lockout by deleting the KV record, with no JWT residual window.
+- **Guarantee ledger integrity at any concurrency level** — use atomic database transactions for every wallet operation so balance = sum of all transactions at all times, with no partial-write corruption possible.
+- **Support per-user risk controls set by the admin** — every user record carries individual max-bet, max-bet-per-day, max-win-per-day, and allowed-sports limits enforced at the API layer before bet acceptance.
+- **Enable real-time risk visibility for operators** — admin dashboard shows live liability by market, live exposure by user, and incoming bet flow in real time via AdminBroadcast Durable Object.
+- **Maintain immutable audit history** — every admin action (odds change, wallet credit, user suspend, bet void) is written to both D1 and Cloudflare R2 as an append-only NDJSON log that cannot be deleted via the API.
+- **Handle live match traffic spikes without pre-scaling** — Cloudflare Workers auto-scale to handle 50,000+ concurrent WebSocket connections per live match; no operator intervention required during India vs Pakistan matches.
+
+### 2.4 Design Principles
+
+- **Backend-only authentication** — the client holds zero auth logic, zero permission checks, and zero decoded user data beyond what the API explicitly returns. All access decisions happen in Hono middleware on the Worker.
+- **Edge-first, server-last** — hot data (odds, market state, sessions, suspension flags) lives in KV and Durable Objects at the edge. The primary database (PlanetScale) is the system of record, not the critical path.
+- **Atomic money, always** — no wallet mutation occurs outside a database transaction. `balance_before` + `amount` = `balance_after` on every ledger row, verifiable at any point in time.
+- **Fail closed on suspension** — any bet placement attempt on a suspended market, by a suspended user, or with a frozen wallet receives an explicit rejection before the DB write. KV suspension flags are checked before any DB operation.
+- **Operator control before user convenience** — account creation, deposit approval, withdrawal processing, and betting enablement are all operator-gated. User self-service exists only for actions that carry no financial or security risk (e.g., viewing bet history, updating display preferences).
+
+---
+
+## 3 — TARGET USERS AND PERSONAS
+
+### Persona 1 — Super Admin / Operator
+
+| Attribute | Detail |
+|---|---|
+| **Name** | Rahul M., 34, Platform Owner / Operator |
+| **Business** | Private sportsbook operation, 200–2,000 active users, agent network of 10–50 sub-agents |
+| **Goals** | Full visibility into platform P&L in real time; ability to instantly suspend any user or market; configure per-user betting limits without developer involvement |
+| **Pains** | Existing white-label platforms require support tickets to change user limits; no real-time liability dashboard; settlement errors require manual DB access to fix |
+| **Usage** | Desktop browser, daily during live match windows; mobile for urgent suspension actions |
+| **Key Features** | Admin Dashboard, User Management, Risk Dashboard, Odds Management, Wallet Management, Audit Log |
+
+### Persona 2 — Agent / Sub-Operator
+
+| Attribute | Detail |
+|---|---|
+| **Name** | Priya S., 27, Betting Agent |
+| **Business** | Manages a portfolio of 20–100 users on behalf of the platform operator |
+| **Goals** | Create new user accounts with configured limits; approve deposits and withdrawals for assigned users; monitor which users are winning to flag for limit review |
+| **Pains** | Current tools require phone calls or WhatsApp messages to the main operator to create accounts; no structured deposit/withdrawal workflow; no visibility into user P&L |
+| **Usage** | Desktop and mobile browser, multiple sessions per day |
+| **Key Features** | User Management (create/edit), Wallet Management (credit/debit/approve), User Activity View |
+
+### Persona 3 — Standard Betting User
+
+| Attribute | Detail |
+|---|---|
+| **Name** | Arjun K., 22, Cricket bettor |
+| **Business** | Individual — bets on Cricket (primary), Football (secondary) |
+| **Goals** | Place bets quickly during live matches; see live odds update in real time without refreshing; track open bets and settled history in one place |
+| **Pains** | Competitor platforms have 3–5 second odds refresh delays; bet slip loses selections on page refresh; no cashout option on live bets; wallet balance not visible during bet placement |
+| **Usage** | Mobile browser, multiple sessions on match days; peaks during T20 and IPL fixtures |
+| **Key Features** | Sports Lobby, Live Match View, Bet Slip, Cricket Live Scoreboard, Wallet Display, Betting History |
+
+### Persona 4 — Read-Only Admin / Risk Analyst
+
+| Attribute | Detail |
+|---|---|
+| **Name** | Dev R., 30, Risk Analyst |
+| **Business** | Employed by the operator to monitor live exposure and flag suspicious betting patterns |
+| **Goals** | Monitor live bet flow and per-market liability in real time; review flagged bets and user activity logs; export settlement and P&L reports |
+| **Pains** | No real-time exposure view without database access; fraud reports delayed by hours; no single view of user P&L across all markets |
+| **Usage** | Desktop browser, continuous monitoring during live match windows |
+| **Key Features** | Risk Dashboard, Bet Management (read-only), Analytics & Reports, Audit Log |
+
+---
+
+## 4 — MARKET CONTEXT AND COMPETITIVE POSITIONING
+
+### 4.1 Problem Statement
+
+The private sportsbook market — operators running books for known user pools rather than public-facing regulated bookmakers — is structurally underserved by existing platform software. Most operators use WhatsApp-based ledgers, Excel sheets, or low-quality script-kiddie sportsbook PHP panels that have no concept of real-time odds, WebSocket delivery, or atomic wallet transactions. The platforms that do exist at enterprise level (BetConstruct, EveryMatrix, SBTech) are built for licensed, publicly facing operators and are priced and architected accordingly — minimum deals in the range of $50K–$200K setup fees, running on traditional VMs with rigid deployment requirements.
+
+The specific structural weakness shared by all existing platforms is their WebSocket architecture. Every major competitor runs a centralized WebSocket server (often a Node.js cluster behind a load balancer) that becomes a bottleneck during high-concurrency live match events. During an India vs Pakistan T20, a centralized WS server handling 50,000 concurrent connections requires pre-provisioned infrastructure, active monitoring, and manual scaling decisions. Cloudflare Durable Objects eliminate this entirely — one DO per match, auto-deployed to the edge, scales to 100K connections with no operator intervention.
+
+The second structural weakness is authentication and session management. PHP-based sportsbook panels often store sessions in Redis or database tables with no instant revocation mechanism. If an operator needs to ban a user mid-match, the user's existing session may remain valid for 15–30 minutes due to JWT TTLs or session cache TTLs. WorldGaming's KV-backed opaque token architecture makes account suspension instant — deleting a KV key revokes access on the next request.
+
+### 4.2 Competitive Landscape
+
+| Competitor | Strengths | Weaknesses |
+|---|---|---|
+| **BetConstruct** | Mature product, large market coverage, regulatory licensing tools | Enterprise-only pricing, centralized WS architecture, no edge deployment, rigid user management |
+| **EveryMatrix** | Strong odds feed integrations, modular products, white-label flexibility | High setup cost, traditional server deployment, no real-time admin dashboard with live DO-level performance |
+| **SBTech (now part of Golden Nugget / DraftKings)** | Strong US sports coverage, tech depth | Not available to private operators; US-market focused |
+| **Script-based PHP panels (ClubHouse, etc.)** | Low cost, easy install | No real-time odds, no atomic wallets, severe security vulnerabilities, no audit trail, no scalability |
+| **Sportradar / Betradar** | Gold-standard data feeds, global coverage | Data provider only — no betting platform; requires integration work |
+
+### 4.3 Positioning Statement
+
+WorldGaming combines Cloudflare Durable Objects-powered sub-50ms live odds delivery with backend-only atomic session management — neither of which any single sportsbook platform in the private-operator segment currently delivers together.
+
+---
+
+## 5 — SCOPE — PHASE 1 IN / OUT
+
+### 5.1 Phase 1 — In Scope
+
+- **Betting Frontend (User)** — Full sports lobby across Cricket, Football, Tennis, and Volleyball; event listing; pre-match and live markets; persistent bet slip with accumulator/parlay support; quick stake buttons; live odds flasher; cashout on open bets; sport-specific live scoreboards for all four sports.
+- **Realtime Live Match Engine** — Cloudflare Durable Objects-based WebSocket hub; one MatchDO per live match; feed ingestion workers for EntitySport (Cricket) and SportMonks (Football); Feed Normalizer Worker; auto-market suspension on in-play events (wicket, goal).
+- **Wallet & Ledger System** — Double-entry append-only ledger; atomic stake deduction and win credit; manual deposit request and admin approval flow; withdrawal request and admin approval/rejection flow; transaction history with filtering; bonus credits.
+- **Admin Panel (/sgyt)** — Full match and event management; odds management with manual override and kill switch; user management (create/edit/suspend/impersonate); wallet management; bet management (live feed, void, manual settlement); risk dashboard; analytics and reports; immutable audit log; 4-level admin hierarchy (Super Admin, Senior Admin, Agent, Read-Only Admin).
+- **Risk & Fraud Engine** — Synchronous per-bet risk scoring (0.0–1.0); per-user and per-market liability tracking in KV; bet delay for live markets; async fraud analysis queue; matched betting detection; odds movement correlation alerts.
+- **Authentication & Security** — Admin-provisioned accounts only; Argon2id password hashing; opaque session tokens in KV with HttpOnly cookies; brute-force rate limiting; device fingerprinting; Cloudflare WAF rules for /sgyt IP allowlisting; 4-layer /sgyt protection.
+
+### 5.2 Phase 2 — Out of Scope
+
+- **Payment gateway integration** — Automated deposit/withdrawal via Razorpay, PayU, or UPI gateway; deferred because Phase 1 validates manual operator-approved flows first, reducing financial risk during initial rollout.
+- **Native mobile applications (iOS / Android)** — React Native or Flutter apps; deferred until the web platform is validated and the WebSocket client patterns are stable.
+- **Self-service user registration** — Public-facing sign-up with KYC; deferred because Phase 1 is an admin-provisioned closed platform for known user bases.
+- **Automated odds feed pricing engine** — Machine-learning-based odds generation from historical data and live feed; Phase 1 uses manual admin odds with external feed reference.
+- **Advanced analytics dashboard** — GGR/NGR trending, cohort analysis, predictive liability modelling; Phase 1 provides raw settlement and bet volume reports.
+- **Multi-currency wallet** — Support for GBP, EUR, USD denominations; Phase 1 is INR-only.
+- **Responsible gambling self-exclusion portal** — User-facing self-exclusion, cooling-off periods, and deposit limit controls accessible by users directly; Phase 1 makes these admin-configurable only.
+
+---
+
+## 6 — FEATURE REQUIREMENTS [P0] — BETTING PLATFORM (USER FRONTEND)
+
+### 6.1 Overview
+
+The User Betting Frontend is the primary interface for all registered betting users. It is served from Cloudflare Pages as a React 18 SPA and communicates with the Hono API on Cloudflare Workers. All session state is managed server-side via KV-backed opaque tokens; the client holds no auth logic. The frontend exists in Phase 1 to convert the admin's match and odds configuration into an interactive betting surface that delivers live odds via WebSocket and processes bet placements through the atomic bet lifecycle.
+
+### 6.2 Account & Session
+
+- Users may only log in with credentials issued by an admin; no self-registration endpoint exists.
+- On login, the Worker validates credentials, generates a 256-bit random opaque token, writes it to `SESSIONS` KV namespace with a 24-hour TTL, and sets an HttpOnly, Secure, SameSite=Strict cookie named `sess_token`.
+- The client receives only `{ userId, username, balance }` in the login response; no role data, no token value.
+- Session TTL slides on every authenticated request (refreshed to 24h from last activity).
+- If a user's account is suspended by an admin, the KV session record is deleted; the user's next request returns HTTP 401 and the client redirects to the login page.
+- Login history is visible to the user — displaying device, IP country, and timestamp for the last 10 successful logins.
+- Account status (Active / Suspended / Betting Disabled) is displayed in the user header on all authenticated pages.
+
+### 6.3 Sports Lobby & Navigation
+
+The sports lobby is the authenticated home page of the platform. It displays all configured active sports with a top navigation tab per sport. Below the sport tabs, events are grouped by league and sorted by start time ascending. Each event card shows home team, away team, start time, top 3 market odds (match winner or equivalent), and a live badge if the match status is `live`.
+
+Supported sports in Phase 1: Cricket, Football, Tennis, Volleyball.
+
+Navigation structure:
+1. Sports tab bar (Cricket / Football / Tennis / Volleyball).
+2. League grouping within the selected sport.
+3. Event cards within each league.
+4. Clicking an event card opens the Match Detail page.
+
+The favourites system allows users to star specific events; starred events appear in a Favourites tab that is the default view on the lobby. Search allows querying active events by team or league name.
+
+### 6.4 Bet Slip
+
+The bet slip is a persistent sidebar on desktop and a bottom-sheet drawer on mobile. It maintains user selections across page navigation without requiring a persistent connection — selection state is stored in Zustand client state and survives SPA route transitions.
+
+Bet slip behaviour:
+
+1. User clicks an odds button on any market — the selection is added to the bet slip.
+2. If the same selection is clicked again, it is removed (toggle off).
+3. Clicking a different selection in the same market replaces the existing selection for that market within an accumulator.
+4. Each selection row shows: event name, market name, selection name, current odds, a stake input field, and potential payout.
+5. Quick stake buttons (₹100, ₹500, ₹1,000, ₹5,000, and a custom input) are available below each stake input.
+6. If the selection's odds change while it is in the bet slip, the odds value flashes green (if increased) or red (if decreased) for 2 seconds, and the potential payout recalculates automatically.
+7. If the selection's market is suspended while it is in the bet slip, the selection row displays a `SUSP` badge in amber, the stake input is disabled, and the Place Bet button is blocked.
+8. Accumulator (multi-bet) mode: when two or more selections are in the bet slip, a parlay row appears below the singles showing the combined odds and combined potential payout based on a single entered stake.
+9. Before submission, a bet confirmation modal shows: selections, stake, odds, and estimated payout. User must confirm.
+10. On submission, if a bet delay is configured for the market (e.g., live in-play), a countdown modal is shown. During the countdown, odds are rechecked. If odds change beyond threshold, the user is notified and must re-confirm or cancel.
+
+### 6.5 Cricket Live Scoreboard
+
+The cricket scoreboard is displayed on the Match Detail page for live cricket events. It receives updates in real time from the MatchDO WebSocket connection established when the user opens the match page.
+
+Components:
+
+- Ball-by-ball live ticker — six-ball over displayed as coloured dot notation (dot, 1, 2, 3, 4, 6, W, WD, NB).
+- Live scorecard — batting: batsman name, runs, balls, 4s, 6s, SR; bowling: bowler name, overs, maidens, runs, wickets, economy.
+- Partnership stats — current partnership runs and balls.
+- Fall of wickets timeline — dismissal event log with over and score.
+- Run rate comparison — current RRR vs CRR as a horizontal bar chart.
+- Live win probability bar — home team win % vs away team win %, updated after each ball.
+- Wagon wheel visual — Phase 2 (deferred; requires additional WebGL rendering work outside core scope).
+
+### 6.6 Football Live Match Display
+
+- Live match timeline — chronological event log (kickoff, goals, yellow/red cards, substitutions, half-time, full-time) as a vertical timeline on the match page.
+- Score ticker — live score in large type with match minute counter updating every 60 seconds via WebSocket.
+- Goal events with scorer name.
+- Card events with player name and minute.
+- Substitution events with players in/out.
+- Match statistics panel — possession, shots on target, corners, fouls (updated every 5 minutes from API feed).
+- Lineups display — starting XI and substitutes for both teams, shown pre-match and during.
+
+### 6.7 Tennis Live Display
+
+- Game/Set/Match score hierarchy — current game score (e.g., 40-15), current set score (e.g., 5-4), match sets (e.g., 1-0).
+- Point-by-point feed — chronological point-by-point ticker with server indicator.
+- Break point indicator — visual badge when a break point is in play.
+- Set history — all completed set scores displayed.
+- Serve speed and ace counter — available where API feed provides this data.
+
+### 6.8 Volleyball Live Display
+
+- Set-by-set scoreline — current set score and historical set scores.
+- Point-by-point within current set — real-time point ticker.
+- Timeout indicators — visual badge when a team has called a timeout.
+- Team momentum indicator — running 5-point differential trend.
+
+### 6.9 Betting History
+
+- All Bets tab — paginated list of all user bets across Open, Settled, and Cancelled/Void statuses.
+- Each bet row shows: bet ID, event name, market, selection, stake, odds, status badge, and settled amount.
+- Clicking a bet row expands to the Bet Detail view: full bet breakdown including placement timestamp, acceptance timestamp, settlement timestamp, and settlement outcome.
+- Filter controls: by sport, by market type, by date range, by status.
+- Running P&L display at the top of the Betting History page — total staked, total returned, net P&L for the selected filter period.
+
+### 6.10 Notifications
+
+Notifications are delivered in two channels:
+
+1. **WebSocket push** — immediate, in-session delivery of: bet settled (win/loss), odds changed on slip selection, market suspended, cashout available, account notices from admin.
+2. **In-app notification centre** — persistent inbox of all notifications stored in the DB, accessible via a bell icon in the header. Unread count badge.
+
+---
+
+## 7 — FEATURE REQUIREMENTS — REALTIME [P0] & LIVE MATCH ENGINE
+
+### 7.1 Overview
+
+The Realtime Engine is the core infrastructure that differentiates WorldGaming from all polling-based sportsbook platforms. It uses Cloudflare Durable Objects as per-match WebSocket hubs, feed ingestion Workers for external API data, and Cloudflare KV for sub-millisecond suspension flag reads. This module exists in Phase 1 because the entire live betting product is non-functional without it — no DO means no real-time odds, no auto-suspension, and no live scoreboards.
+
+### 7.2 Durable Objects Architecture
+
+Four Durable Object classes are deployed in Phase 1:
+
+1. **MatchDurableObject** — one singleton instance per live match, identified by `match:{matchId}`. Stores current match state (score, market states, live odds snapshot) in DO persistent storage. Manages all WebSocket connections watching that match. Broadcasts score updates, odds changes, and market suspension events to all connected clients simultaneously. Triggers auto-market suspension when a goal (football) or wicket (cricket) event is received.
+
+2. **OddsEngineDurableObject** — one singleton per sport during live periods. Receives raw odds from feed ingestion Workers. Applies margin calculation: `final_odds = raw_odds × (1 - margin%)`. Checks liability before accepting odds update. Writes new odds to KV (`odds:{matchId}:{marketId}`) and calls the relevant MatchDO to broadcast.
+
+3. **BettingSlipDurableObject** — one instance per active user session. Prevents double-submission race conditions by acting as a distributed lock during bet placement. Coordinates the multi-step bet placement flow described in Section 12.
+
+4. **AdminBroadcastDurableObject** — one singleton for the admin panel. Manages all admin dashboard WebSocket connections. Broadcasts: incoming bet flow, risk changes, market suspension events, and live P&L updates.
+
+### 7.3 WebSocket Connection Lifecycle
+
+1. Browser opens `wss://ws.worldgaming.eu.org/match/{matchId}`.
+2. Cloudflare Worker validates the `sess_token` cookie against KV.
+3. If valid, Worker routes to `MatchDO.idFromName("match:{matchId}")`.
+4. Worker calls `do.fetch(upgradeRequest)`.
+5. DO accepts the WebSocket via the Hibernation API.
+6. DO immediately sends the current `matchState` snapshot as an `init` message.
+7. All subsequent score and odds updates are broadcast to all connected sockets from the DO.
+8. On WebSocket close or error, the DO cleans up the connection handle.
+
+The Hibernation API is used (not always-active WebSockets) so that DO CPU billing is only incurred during actual message processing, not idle connection holding.
+
+### 7.4 Feed Ingestion Architecture
+
+External data enters the system through two pathways:
+
+**Webhook push (football via SportMonks):** SportMonks posts match events to `https://api.worldgaming.eu.org/webhooks/sportmonks`. The Worker validates the webhook signature, normalises the payload to the internal event schema `{ matchId, sport, eventType, data, timestamp }`, and forwards it to the appropriate MatchDO.
+
+**Polling worker (cricket via EntitySport, tennis/volleyball via API-Sports):** A scheduled Cloudflare Worker polls external APIs on a 5–30 second interval depending on sport and match status. Polling is paused for matches with status `upcoming` more than 30 minutes from start. On data receipt, the same normalisation and MatchDO forwarding pattern applies.
+
+The Feed Normalizer Worker is responsible for:
+- Translating all external sport-specific schemas into the unified internal schema.
+- Deduplicating events using timestamp + event fingerprint hashing.
+- Routing events to the correct MatchDO instance.
+
+### 7.5 Auto-Market Suspension Rules
+
+The MatchDO applies automatic suspension rules without admin involvement:
+
+| Trigger Event | Sport | Action | Auto-Reopen |
+|---|---|---|---|
+| Wicket fallen | Cricket | Suspend all live cricket markets for this match | After 30 seconds, unless admin manually extends |
+| Goal scored | Football | Suspend all football markets for this match | After 60 seconds |
+| Set completed | Tennis | Suspend all in-play tennis markets | After 30 seconds |
+| Network data gap > 60s | Any | Suspend all live markets for affected match | After data resumes |
+| Admin kill switch | Any | Suspend all markets on platform | Manual reopen only |
+
+Suspension state is written to `SUSPENDED_MARKETS` KV namespace with the match ID as key. All bet placement Workers read this KV key as the first step of the validation pipeline — before any DB query — so suspension enforcement adds less than 1ms to the request path.
+
+### 7.6 Odds Update Lifecycle (Timing)
+
+| Step | Time | Action |
+|---|---|---|
+| T+0ms | External API/Webhook receives new odds |
+| T+10ms | Feed ingestion Worker receives event |
+| T+15ms | Margin calculation applied: `final_odds = raw_odds × (1 - margin%)` |
+| T+20ms | Liability check — if new odds cause liability > max_liability, update rejected |
+| T+25ms | KV Write: `odds:{matchId}:{marketId}` → new odds object |
+| T+30ms | D1 write to `odds_history` table queued async |
+| T+35ms | MatchDO.update() called with new odds |
+| T+40ms | MatchDO broadcasts to all connected WebSockets |
+| T+50ms | Browser clients receive update; frontend flashes price change |
+
+---
+
+## 8 — FEATURE REQUIREMENTS — WALLET [P0] & LEDGER SYSTEM
+
+### 8.1 Overview
+
+The Wallet and Ledger System is the financial backbone of WorldGaming. It uses a double-entry append-only ledger design — every financial event creates an immutable transaction record with `balance_before` and `balance_after` — ensuring that the sum of all transactions for a user equals their current wallet balance at any point in time. This module is in Phase 1 because no bet can be placed without atomic stake deduction, and no settlement can occur without atomic win credit.
+
+### 8.2 Wallet Record
+
+Each user has exactly one wallet record. The wallet record is the source of truth for current balance. Fields:
+
+- `balance` — main wallet balance (decimal, currency in INR for Phase 1).
+- `bonus` — bonus credit balance (tracked separately; not withdrawable).
+- `frozen` — boolean flag set by admin to prevent all wallet operations.
+- `currency` — `INR` for Phase 1.
+
+### 8.3 Atomic Wallet Operations
+
+All wallet mutations (stake deduction, win credit, deposit credit, withdrawal debit) execute inside a database transaction:
+
+1. SELECT wallet record with row lock.
+2. Validate: wallet not frozen, sufficient balance (for deductions), amount positive.
+3. Calculate new balance.
+4. UPDATE wallet record with new balance and `updated_at`.
+5. INSERT transaction record with `balance_before`, `amount`, `balance_after`, `type`, `reference_id`, and `created_at`.
+6. COMMIT. If any step fails, the entire transaction rolls back; no partial state is possible.
+
+### 8.4 Transaction Types
+
+| Type | Direction | Trigger |
+|---|---|---|
+| `deposit` | Credit (+) | Admin approves deposit request |
+| `withdrawal` | Debit (−) | Admin approves withdrawal request |
+| `bet_stake` | Debit (−) | Bet accepted by system |
+| `bet_win` | Credit (+) | Bet settled as win |
+| `bet_refund` | Credit (+) | Bet voided or settled as push |
+| `cashout` | Credit (+) | User-initiated cashout of open bet |
+| `bonus` | Credit (+) | Admin issues bonus credit |
+| `admin_credit` | Credit (+) | Manual admin adjustment (credit) |
+| `admin_debit` | Debit (−) | Manual admin adjustment (debit) |
+
+### 8.5 Deposit Flow
+
+1. User submits deposit request via the wallet page — enters amount, selects method (informational only in Phase 1; no gateway), optionally attaches a reference note.
+2. Deposit request is created in the `deposit_requests` table with `status=pending`.
+3. User sees "Your deposit request is under review" confirmation.
+4. Admin sees the pending deposit request in the admin Wallet Management panel.
+5. Admin verifies payment externally (bank transfer, UPI, etc.).
+6. Admin clicks Approve — system executes atomic wallet credit and sets request `status=approved`.
+7. Notification is pushed to the user's WebSocket connection: "Deposit of ₹X approved."
+8. If admin clicks Reject — request `status=rejected`, user is notified with a reason.
+
+### 8.6 Withdrawal Flow
+
+1. User submits withdrawal request — enters amount and bank/UPI details.
+2. System validates: amount ≥ minimum withdrawal threshold (admin-configured), available balance (wallet balance minus stake held in open bets) ≥ requested amount.
+3. Withdrawal amount is held (not deducted) — a `pending_withdrawal` field on the wallet prevents double-spending.
+4. Withdrawal request created with `status=pending`.
+5. Admin reviews and either approves (system deducts from wallet atomically, marks request completed) or rejects (held amount released back to available balance, user notified with reason).
+
+### 8.7 Cashout
+
+1. User clicks Cashout on an open bet from the Betting History or Bet Slip.
+2. System fetches current odds for the bet selection.
+3. Cashout value calculated: `cashout_value = (current_odds / original_odds) × stake × (1 - cashout_margin)`.
+4. If `cashout_value ≤ 0`, cashout is blocked.
+5. A cashout confirmation modal shows the calculated value.
+6. On user confirmation, wallet is credited atomically, bet `status` updated to `settled`, `outcome` to `cashout`.
+
+---
+
+## 9 — FEATURE REQUIREMENTS — ADMIN [P0] PANEL (/sgyt)
+
+### 9.1 Overview
+
+The Admin Panel is the operator's control plane, accessible only at the `/sgyt` path. It is protected by four independent security layers before any admin user reaches a functional screen. It is the surface through which all match management, odds management, user management, wallet operations, risk monitoring, and reporting occur. No production change to any user, market, wallet, or match can occur except through this panel or its corresponding API — there is no other write path to the production database.
+
+### 9.2 /sgyt Access Security Layers
+
+1. **Cloudflare WAF Rule (Layer 1):** If `URI path contains /sgyt` AND `IP not in admin_ip_allowlist` → Block (HTTP 403 before hitting the Worker).
+2. **Cloudflare Zero Trust (Layer 2):** Cloudflare Access policy applied to `/sgyt/*` requiring email OTP or TOTP from registered admin accounts.
+3. **Worker adminGuard Middleware (Layer 3):** Session role must be one of `superadmin | senior_admin | agent | readonly_admin`. Any `user` role session returns HTTP 403.
+4. **Admin Session Namespace (Layer 4):** Admin sessions are stored in a separate KV namespace from user sessions. Admin sessions have an 8-hour TTL (shorter than user 24-hour TTL). Admin sessions are invalidated on significant IP change.
+
+### 9.3 Admin Role Hierarchy
+
+| Role | Create Users | Edit Odds | Void Bets | Delete Records | Manage Admins | Reports |
+|---|---|---|---|---|---|---|
+| **Super Admin** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Senior Admin** | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ |
+| **Agent** | ✅ (own users only) | ❌ | ❌ | ❌ | ❌ | Own users only |
+| **Read-Only Admin** | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ (view) |
+
+### 9.4 Dashboard
+
+The admin dashboard is the landing page after /sgyt login. It displays live KPIs via the AdminBroadcastDO WebSocket connection:
+
+- Active sessions count (users currently logged in).
+- Open bets count and total staked value.
+- Total open liability across all markets.
+- P&L today (settled bets net).
+- Real-time bet flow ticker — incoming bets displayed as a live feed with user ID, market, stake, and odds.
+- Revenue chart — hourly bars for today; switchable to daily for current week.
+- Risk exposure heatmap — liability per match as a colour-coded grid.
+- Top 5 markets by volume (current day).
+- Suspicious activity alert count badge.
+
+### 9.5 Match & Event Management
+
+Admins manage the match schedule that populates the user-facing sports lobby.
+
+Create match workflow:
+1. Admin selects sport and league from dropdowns.
+2. Admin enters home team, away team, venue, and start time.
+3. Admin selects odds feed source (EntitySport / SportMonks / Manual).
+4. Admin sets `betting_open` to enabled.
+5. Match appears in the user lobby on the scheduled start date.
+
+Additional match management operations:
+- Edit any field on a scheduled match before it goes live.
+- Suspend entire match — sets all markets to suspended, removes match from live section for users.
+- Mark match as resulted — triggers the settlement pipeline; admin enters final score and result object.
+- Delete match — Super Admin only; only permitted on `upcoming` matches with no accepted bets.
+
+### 9.6 Odds Management
+
+- Per-selection live odds display, updated in real time via AdminBroadcastDO.
+- Manual odds override — admin enters new odds for a selection; system applies margin, validates liability, writes to KV and D1.
+- Margin/overround setting per market — admin configures margin percentage (default 5%); all auto-fed odds are adjusted by this margin.
+- Suspend individual market — sets market `status=suspended` in DB and KV suspension flag.
+- Suspend all markets (kill switch) — single button; suspends all open markets across all sports platform-wide; requires Super Admin or Senior Admin role.
+- Odds movement history log — per-selection timeline of all odds changes with timestamp, old value, new value, and changed-by (admin ID or `auto`).
+- Auto-suspend rules configuration — admin can modify the default auto-suspend triggers (e.g., change wicket suspension window from 30s to 60s).
+
+### 9.7 User Management
+
+- **Create user** — Admin enters: username, system-generated or custom password, max_bet, max_bet_per_day, max_win_per_day, allowed_sports JSON array, initial wallet balance, and agent notes. Password is hashed with Argon2id before DB write. Audit log entry created.
+- **View user profile** — All user fields, current wallet balance, open bet count, today's P&L, login history, device fingerprints.
+- **Edit user limits** — Any limit field editable post-creation; changes take effect on the next bet placement.
+- **Enable/disable betting** — Toggle `betting_enabled` flag; takes effect immediately (checked at bet placement).
+- **Suspend account** — Sets `status=suspended`; deletes all active KV sessions for the user; instant lockout.
+- **Ban account** — Permanent; `status=banned`; cannot be reinstated without Super Admin action.
+- **Reset password** — Admin sets a new hashed password; active sessions revoked.
+- **Impersonate user (view-only)** — Admin can see the user's frontend view without being able to place bets; logged in audit trail with `action=user.impersonate`.
+- **User activity log** — Complete log of login events, bet placements, wallet events, and admin actions affecting this user.
+
+### 9.8 Wallet Management
+
+- View any user's current balance, bonus balance, and frozen status.
+- Manual credit — Admin enters amount and reason; atomic wallet credit with `admin_credit` transaction type; logged in audit trail.
+- Manual debit — Admin enters amount and reason; atomic wallet debit; logged.
+- Approve/reject deposit requests — paginated queue of pending deposit requests.
+- Approve/reject withdrawal requests — paginated queue of pending withdrawal requests.
+- Freeze wallet — Sets `frozen=true`; blocks all wallet operations for that user until unfrozen.
+- Bonus credit — Credit to the `bonus` balance field (not main balance, not withdrawable).
+- Transaction history per user — full ledger view with all transaction types and running balance column.
+
+### 9.9 Bet Management
+
+- **Live bet feed** — Real-time stream of incoming bet placements via AdminBroadcastDO.
+- **Bet list** — Searchable, paginated list of all bets; filterable by status, sport, market, user, date range.
+- **Bet detail** — Full bet record including placement time, odds at time of placement, stake, user risk score, and any fraud flags.
+- **Cancel/void bet** — Sets bet `status=void`; triggers atomic stake refund via bet_refund transaction type; logged.
+- **Manual settlement** — Admin enters outcome and settlement amount for a specific bet; bypasses the automated settlement pipeline.
+- **Flag for review** — Sets a `review_flag` on the bet; flags appear in the Risk Dashboard flagged bets queue.
+- **Bulk operations** — Select multiple bets and apply void or settle in bulk; Super Admin and Senior Admin only.
+
+### 9.10 Analytics & Reports
+
+All reports are generated server-side and available for CSV download stored to Cloudflare R2.
+
+| Report | Content | Frequency |
+|---|---|---|
+| Settlement Report | All settled bets, outcomes, P&L by market | Daily / on demand |
+| Revenue Report | GGR and NGR by sport, league, and market | Daily / weekly / monthly |
+| User P&L Report | Net P&L per user for selected date range | On demand |
+| Bet Volume Report | Bet count and staked amount by hour/day | Daily |
+| Fraud Report | All fraud-flagged bets and user risk scores | Daily |
+| Hold % Report | Hold percentage by market type | Weekly |
+
+### 9.11 Audit Log
+
+Every admin action generates an immutable audit log entry written synchronously to D1 and asynchronously (via Cloudflare Queues) to R2 as NDJSON.
+
+Each audit log entry contains: `adminId`, `adminRole`, `action` (e.g., `user.create`, `bet.void`, `odds.update`), `entityType`, `entityId`, `before` (JSON state snapshot), `after` (JSON state snapshot), `ipAddress`, `userAgent`, and `timestamp`.
+
+The audit log is read-only via the API. Deletion requires Super Admin access and a secondary confirmation step; all purge events are themselves logged.
+
+---
+
+## 10 — FEATURE REQUIREMENTS — RISK [P1] & FRAUD ENGINE
+
+### 10.1 Overview
+
+The Risk and Fraud Engine runs synchronously (risk scoring) and asynchronously (fraud analysis) relative to the bet placement flow. Risk scoring runs inline before bet acceptance — it can block or flag a bet before the stake is deducted. Fraud analysis runs asynchronously via Cloudflare Queues so that it does not add latency to the acceptance path. Both systems feed the admin's Risk Dashboard in real time.
+
+### 10.2 Synchronous Risk Scoring
+
+Every bet receives a risk score between 0.0 and 1.0 computed by the Risk Engine Worker before acceptance. The score combines the following factors:
+
+| Factor | Description |
+|---|---|
+| `stakeVsUserAverage` | Is this stake significantly larger than the user's historical average? |
+| `stakeVsMarketLimit` | What percentage of the market's max liability does this bet consume? |
+| `oddsValue` | High-odds bets carry higher variance risk |
+| `userRecentPnL` | Users on large winning streaks get higher risk scores |
+| `userWinRate` | Historical win rate above bookmaker theoretical hold |
+| `timeToEvent` | Last-minute bets on live markets are higher risk |
+| `marketLiquidity` | Thin markets with few bets amplify individual bet impact |
+
+If `risk_score > 0.7`, the bet is flagged for admin review but still accepted (non-blocking by default; configurable to blocking mode per market). If `risk_score > 0.9`, the bet is held pending manual admin approval.
+
+### 10.3 Per-User Limit Enforcement
+
+Before bet acceptance, the following limits are enforced sequentially. Any failure returns a specific rejection reason to the client:
+
+1. `betting_enabled` flag on user record must be `true`.
+2. Bet stake must not exceed `max_bet` for the user.
+3. User's total staked amount today must not exceed `max_bet_per_day`.
+4. User's total potential winnings today must not exceed `max_win_per_day`.
+5. User's allowed_sports must include the sport of the market.
+
+### 10.4 Market Liability Management
+
+- Per-market liability is tracked in real time in KV namespace `MARKET_LIABILITY`: `key: liability:{matchId}:{marketId}:{selectionId}` → `{ totalStaked, totalPotentialPayout }`.
+- On every bet placement, KV liability is updated atomically.
+- If a new bet would cause total potential payout for a selection to exceed `market.max_liability`, the bet is rejected.
+- Liability values are displayed in the admin Risk Dashboard in real time.
+
+### 10.5 Async Fraud Analysis
+
+After bet acceptance, the bet is published to the `fraud-analysis-queue`. The Fraud Analysis Worker processes it asynchronously and writes fraud flags to the `fraud_flags` table. Fraud detection rules:
+
+- **Matched betting detection** — Bets placed across correlated selections in close time proximity on the same market (betting both sides).
+- **Syndicate detection** — Multiple user accounts with the same device fingerprint or IP placing similar bets simultaneously.
+- **Sharp bettor identification** — User win rate consistently exceeds the theoretical hold by more than 2 standard deviations over 30+ bets.
+- **Unusual stake spike** — Stake is more than 5× the user's 30-day average without prior history of large stakes.
+
+Fraud flags are surfaced in the admin Risk Dashboard and flagged bets queue. Admins can dismiss flags, void bets, or take user management action directly from the flag detail view.
+
+---
+
+## 11 — SCREEN INVENTORY
+
+### Module: Betting Frontend (User)
+
+| Screen ID | Screen Name | Surface | Primary Action | Access |
+|---|---|---|---|---|
+| BET-01 | Login | Web + Mobile | Authenticate with credentials | Public (unauthenticated) |
+| BET-02 | Sports Lobby | Web + Mobile | Browse events and select a match | User |
+| BET-03 | Match Detail — Cricket | Web + Mobile | View cricket scoreboard, browse markets, add to bet slip | User |
+| BET-04 | Match Detail — Football | Web + Mobile | View football timeline, browse markets, add to bet slip | User |
+| BET-05 | Match Detail — Tennis | Web + Mobile | View tennis scores, browse markets, add to bet slip | User |
+| BET-06 | Match Detail — Volleyball | Web + Mobile | View volleyball scores, browse markets, add to bet slip | User |
+| BET-07 | Bet Slip (Sidebar/Drawer) | Web + Mobile | Review selections, enter stake, place bet | User |
+| BET-08 | Bet Confirmation Modal | Web + Mobile | Confirm bet before submission | User |
+| BET-09 | Bet Delay Countdown Modal | Web + Mobile | Wait for in-play bet delay; cancel if desired | User |
+| BET-10 | Betting History | Web + Mobile | View and filter all bets | User |
+| BET-11 | Bet Detail | Web + Mobile | View full detail of a single bet | User |
+| BET-12 | Wallet | Web + Mobile | View balance, submit deposit/withdrawal requests, view transactions | User |
+| BET-13 | Deposit Request Form | Web + Mobile | Submit deposit request | User |
+| BET-14 | Withdrawal Request Form | Web + Mobile | Submit withdrawal request | User |
+| BET-15 | Transaction History | Web + Mobile | Browse and filter transaction ledger | User |
+| BET-16 | Notification Centre | Web + Mobile | View all notifications | User |
+| BET-17 | Account / Login History | Web + Mobile | View account status and login history | User |
+
+### Module: Admin Panel (/sgyt)
+
+| Screen ID | Screen Name | Surface | Primary Action | Access |
+|---|---|---|---|---|
+| ADM-01 | Admin Login | Web | Authenticate as admin | Admin (unauthenticated) |
+| ADM-02 | Admin Dashboard | Web | Monitor live KPIs and bet flow | All admin roles |
+| ADM-03 | Match List | Web | Browse and manage all matches | SA, Senior, Agent (view) |
+| ADM-04 | Match Detail / Odds Editor | Web | Edit match, manage odds and markets | SA, Senior |
+| ADM-05 | Create Match | Web | Create a new match and attach feed | SA, Senior |
+| ADM-06 | User List | Web | Browse and search all users | SA, Senior, Agent (own) |
+| ADM-07 | User Profile | Web | View user detail, limits, activity | SA, Senior, Agent (own) |
+| ADM-08 | Create User | Web | Create new betting user | SA, Senior, Agent |
+| ADM-09 | Edit User | Web | Edit user limits and status | SA, Senior, Agent (own) |
+| ADM-10 | Bet Management | Web | Browse, void, settle, and flag bets | SA, Senior |
+| ADM-11 | Bet Detail (Admin) | Web | View full bet record and flags | SA, Senior, RO |
+| ADM-12 | Wallet Management | Web | View balances, credit/debit, approve deposits/withdrawals | SA, Senior, Agent (own) |
+| ADM-13 | Deposit Request Queue | Web | Review and approve/reject pending deposits | SA, Senior, Agent (own) |
+| ADM-14 | Withdrawal Request Queue | Web | Review and approve/reject pending withdrawals | SA, Senior, Agent (own) |
+| ADM-15 | Risk Dashboard | Web | Live liability heatmap, flagged bets, exposure by user | SA, Senior, RO |
+| ADM-16 | Reports | Web | Generate and export analytics reports | SA, Senior, RO |
+| ADM-17 | Audit Log | Web | Search and view immutable admin action log | SA, Senior, RO |
+| ADM-18 | Admin Settings | Web | Configure platform-wide settings (margins, limits, auto-suspend rules) | SA only |
+
+**Total screen count: 35 screens across 2 modules.**
+
+---
+
+## 12 — KEY USER FLOWS [P0]
+
+### Flow 1 — User Places a Live Cricket Bet
+
+| Field | Detail |
+|---|---|
+| **Flow ID** | FLOW-01 |
+| **Persona** | Standard Betting User (Arjun K.) |
+| **Entry Point** | BET-02 Sports Lobby — User taps the Cricket tab and selects a live match |
+| **Success State** | Bet is accepted; user sees "Bet Placed ✓" toast; bet appears in Betting History with status `open`; wallet balance reflects stake deduction |
+
+| Step | Actor | Action | System Response |
+|---|---|---|---|
+| 1 | User | Taps Cricket tab, selects live match | Browser opens BET-03 Match Detail — Cricket; WebSocket connection established to MatchDO; current match state and odds delivered via `init` message |
+| 2 | System | MatchDO pushes live odds | Odds flasher updates on screen; potential payout calculator recalculates |
+| 3 | User | Clicks odds button for "India to win" | Selection added to Bet Slip (BET-07); market, selection, current odds, and payout preview shown |
+| 4 | User | Enters ₹500 stake using quick stake button | Potential payout recalculates to `stake × odds` |
+| 5 | User | Clicks "Place Bet" | BET-08 Bet Confirmation Modal opens; shows selection, stake, odds, and estimated payout |
+| 6 | User | Clicks "Confirm" | Worker validates: session, market status (KV), user limits, sufficient balance, bet delay |
+| 7 | System | Applies 3-second live bet delay | BET-09 Bet Delay Countdown Modal shown; odds rechecked during countdown |
+| 8 | System | Odds unchanged during delay | Countdown completes; bet accepted; atomic stake deduction executed |
+| 9 | System | Bet record created (status=open) | Response `{ betId, status: "accepted", odds, potentialWin }` returned to client |
+| 10 | System | Fraud analysis queued async | BetSlipDO lock released |
+| 11 | User | Sees "Bet Placed ✓" toast | Bet Slip clears; wallet balance in header updates |
+
+| Edge Case | System Behaviour |
+|---|---|
+| Market suspended during countdown | Countdown aborted; BET-09 shows "Market suspended — bet cancelled"; no stake deduction |
+| Odds change > 5% during countdown | BET-09 shows updated odds; user must re-confirm or cancel |
+| Insufficient balance at confirm | HTTP 400 returned; BET-08 shows "Insufficient balance"; no stake deduction |
+| User betting disabled | HTTP 403 returned; BET-08 shows "Betting is currently disabled on your account" |
+| Network drops during confirm | BettingSlipDO detects incomplete state; bet rejected; stake not deducted; idempotency key prevents double submission |
+
+---
+
+### Flow 2 — Admin Creates a New User Account
+
+| Field | Detail |
+|---|---|
+| **Flow ID** | FLOW-02 |
+| **Persona** | Agent (Priya S.) |
+| **Entry Point** | ADM-06 User List — Agent clicks "Create User" button |
+| **Success State** | New user record created in DB; wallet initialised with configured balance; audit log entry created; Agent sees the new user in the User List |
+
+| Step | Actor | Action | System Response |
+|---|---|---|---|
+| 1 | Agent | Clicks "Create User" on ADM-06 | Browser opens ADM-08 Create User form |
+| 2 | Agent | Enters username, initial password, max_bet limits, allowed sports, initial balance | Client-side Zod validation validates field formats before submission |
+| 3 | Agent | Clicks "Create" | Worker validates Agent role; checks username uniqueness in DB |
+| 4 | System | Username unique confirmed | Argon2id hashes password (≈300ms); user record inserted; wallet created; initial credit transaction inserted atomically |
+| 5 | System | Audit log entry written | `action=user.create`, `adminId`, `before=null`, `after=user_record` |
+| 6 | Agent | Sees success confirmation with new User ID | Browser redirects to ADM-07 User Profile for the new user |
+
+| Edge Case | System Behaviour |
+|---|---|
+| Username already taken | HTTP 409 returned; ADM-08 shows "Username already exists" inline error |
+| Agent attempts to set limits beyond own agent permissions | HTTP 403; ADM-08 shows "You cannot set limits above your own configured ceiling" |
+| DB write fails mid-transaction | Full rollback; no partial user or wallet record created; HTTP 500; agent sees "Account creation failed — please retry" |
+
+---
+
+### Flow 3 — Admin Settles a Match and Bets Are Settled
+
+| Field | Detail |
+|---|---|
+| **Flow ID** | FLOW-03 |
+| **Persona** | Super Admin (Rahul M.) |
+| **Entry Point** | ADM-04 Match Detail — Admin clicks "Mark as Resulted" |
+| **Success State** | Match `status=completed`; all markets settled; winning users' wallets credited; settlement notifications pushed to users |
+
+| Step | Actor | Action | System Response |
+|---|---|---|---|
+| 1 | Admin | Navigates to ADM-04 for completed match | Match Detail shows all markets and open bet counts |
+| 2 | Admin | Clicks "Mark as Resulted" | Result entry modal opens; admin enters home score, away score, and selects winning selections per market |
+| 3 | Admin | Confirms result | Worker validates Super Admin or Senior Admin role; match `status` updated to `completed`; all markets set to `suspended` immediately |
+| 4 | System | Match result published to settlement queue | Settlement Worker dequeues batches of 10 bets per market |
+| 5 | System | For each winning bet | Atomic wallet credit executed (`bet_win` transaction); bet `status=settled`, `outcome=win` |
+| 6 | System | For each losing bet | Bet `status=settled`, `outcome=loss`; no wallet operation |
+| 7 | System | For each void bet | Atomic stake refund (`bet_refund` transaction); bet `status=void` |
+| 8 | System | All markets set to `settled` | Settlement completion event broadcast via AdminBroadcastDO |
+| 9 | System | User notifications queued | Users receive in-app push: "Your bet on [market] has been settled — [Win/Loss] ₹X" |
+
+| Edge Case | System Behaviour |
+|---|---|
+| Settlement Worker queue depth > 1000 | PagerDuty/Telegram critical alert triggered; parallel consumer Workers auto-scaled |
+| DB connection failure during settlement | Queue message is retried up to 3 times with exponential backoff; settlement remains pending |
+| Admin enters wrong result | Super Admin can trigger re-settlement with corrected result; all previously settled bets for that market are voided, wallets reversed, and re-settled with correct outcome; full audit log of re-settlement |
+
+---
+
+### Flow 4 — Admin Suspends a User Mid-Match
+
+| Field | Detail |
+|---|---|
+| **Flow ID** | FLOW-04 |
+| **Persona** | Super Admin (Rahul M.) |
+| **Entry Point** | ADM-07 User Profile — Admin clicks "Suspend Account" |
+| **Success State** | User's account `status=suspended`; all active sessions deleted from KV; user's next request returns 401; user cannot access any authenticated page |
+
+| Step | Actor | Action | System Response |
+|---|---|---|---|
+| 1 | Admin | Opens ADM-07 for target user | User Profile shows current status `active` |
+| 2 | Admin | Clicks "Suspend Account" | Confirmation modal: "This will immediately log the user out and disable all access. Confirm?" |
+| 3 | Admin | Confirms suspension | Worker sets user `status=suspended` in DB |
+| 4 | System | Scans `user_sessions:{userId}` KV index | Retrieves all active session token keys for the user |
+| 5 | System | Deletes all session tokens from KV | All sessions invalidated simultaneously |
+| 6 | System | Audit log entry written | `action=user.suspend`, `before={status:"active"}`, `after={status:"suspended"}` |
+| 7 | User (affected) | Makes any API request | Worker reads session from KV → KV miss → 401 returned → client redirects to BET-01 Login |
+
+| Edge Case | System Behaviour |
+|---|---|
+| User is mid-bet-placement when suspension executes | BettingSlipDO session validation check fails; bet rejected with 401; stake not deducted |
+| User's open bets — do they stand? | Open bets remain valid and will be settled normally; suspension affects access, not existing accepted bets |
+
+---
+
+### Flow 5 — User Deposits Funds (Manual Approval Flow)
+
+| Field | Detail |
+|---|---|
+| **Flow ID** | FLOW-05 |
+| **Persona** | Standard Betting User (Arjun K.) |
+| **Entry Point** | BET-12 Wallet page — user clicks "Deposit" |
+| **Success State** | Deposit request approved by admin; wallet balance updated; user sees updated balance with confirmation notification |
+
+| Step | Actor | Action | System Response |
+|---|---|---|---|
+| 1 | User | Clicks "Deposit" on BET-12 | BET-13 Deposit Request Form opens |
+| 2 | User | Enters deposit amount and reference note | Client-side validation: amount must be positive |
+| 3 | User | Submits request | Deposit request created with `status=pending`; user sees "Request submitted — awaiting approval" |
+| 4 | Admin | Sees pending request in ADM-13 | Request listed with user ID, amount, and timestamp |
+| 5 | Admin | Verifies payment externally | Admin clicks "Approve" on ADM-13 |
+| 6 | System | Atomic wallet credit executed | `deposit` transaction record created; wallet balance updated |
+| 7 | System | Notification pushed to user WebSocket | BET-16 notification: "Deposit of ₹X approved and credited to your wallet" |
+| 8 | User | Sees updated balance in header | Balance reflects new deposit |
+
+| Edge Case | System Behaviour |
+|---|---|
+| Admin rejects deposit | Deposit request `status=rejected`; user notified with admin-entered rejection reason |
+| User submits duplicate deposit request | Second request created as a separate pending item; admin reviews both independently |
+
+---
+
+### Flow 6 — Admin Manually Overrides Odds
+
+| Field | Detail |
+|---|---|
+| **Flow ID** | FLOW-06 |
+| **Persona** | Super Admin / Senior Admin |
+| **Entry Point** | ADM-04 Match Detail / Odds Editor — Admin edits a selection's odds |
+| **Success State** | New odds live for users within 50ms; KV updated; odds_history record created; users in Bet Slip see flash update |
+
+| Step | Actor | Action | System Response |
+|---|---|---|---|
+| 1 | Admin | Opens ADM-04 for a live match | Odds Editor shows live odds for all markets and selections |
+| 2 | Admin | Clicks on a selection's odds field and enters new value | Client-side validation: odds must be > 1.0 and ≤ 1000.0 |
+| 3 | Admin | Clicks "Update" | Worker validates admin role; applies margin: `final_odds = input × (1 - market_margin%)` |
+| 4 | System | Liability check | If new odds would cause `total_potential_payout > max_liability` for this selection, update blocked with warning |
+| 5 | System | KV write | `odds:{matchId}:{marketId}` updated with new odds and timestamp |
+| 6 | System | D1 write queued | `odds_history` row inserted async |
+| 7 | System | MatchDO called | MatchDO broadcasts odds update to all connected user WebSockets |
+| 8 | Users | Receive update | Odds on BET-03/04/05/06 flash green or red; Bet Slip payout recalculates |
+| 9 | Admin | Sees updated odds on ADM-04 | Odds movement log entry appears in real time |
+
+---
+
+### Flow 7 — User Requests Cashout on Open Bet
+
+| Field | Detail |
+|---|---|
+| **Flow ID** | FLOW-07 |
+| **Persona** | Standard Betting User |
+| **Entry Point** | BET-10 Betting History — User clicks "Cashout" on an open bet |
+| **Success State** | Cashout value credited to wallet; bet status updated to `settled/cashout`; user notified |
+
+| Step | Actor | Action | System Response |
+|---|---|---|---|
+| 1 | User | Clicks "Cashout" on open bet in BET-10 | Worker fetches current odds for the bet selection |
+| 2 | System | Calculates cashout value | `cashout_value = (current_odds / original_odds) × stake × (1 - cashout_margin)` |
+| 3 | System | Validates cashout_value > 0 | If ≤ 0 (odds moved strongly against user), cashout button is hidden/disabled |
+| 4 | User | Sees cashout confirmation modal with value | Modal shows: original stake, original odds, current odds, cashout value |
+| 5 | User | Confirms cashout | Atomic wallet credit of `cashout_value`; bet `outcome=cashout`, `status=settled` |
+| 6 | User | Sees updated balance and settled bet | Bet in BET-10 shows cashout outcome and amount |
+
+---
+
+### Flow 8 — Admin Applies Global Market Kill Switch
+
+| Field | Detail |
+|---|---|
+| **Flow ID** | FLOW-08 |
+| **Persona** | Super Admin / Senior Admin |
+| **Entry Point** | ADM-04 or ADM-18 — Admin activates the global kill switch |
+| **Success State** | All open markets across all sports suspended; no new bets accepted; users see SUSP badges on all markets within 2 seconds |
+
+| Step | Actor | Action | System Response |
+|---|---|---|---|
+| 1 | Admin | Clicks "Suspend All Markets" kill switch on ADM-18 | Confirmation modal: "This will suspend ALL markets platform-wide. Confirm?" |
+| 2 | Admin | Confirms | Worker bulk-writes `SUSPENDED_MARKETS` KV entries for all active match IDs |
+| 3 | System | AdminBroadcastDO broadcasts global suspension event | All MatchDOs receive suspension message and relay to connected user WebSockets |
+| 4 | Users | Receive `market_suspension` WebSocket message | All BET-03/04/05/06 screens show SUSP badge on all markets; bet slip disables all selections |
+| 5 | System | All subsequent bet placement requests | Worker reads KV suspension flag → returns HTTP 423 (market suspended) before any DB query |
+| 6 | Admin | Manually unsuspends markets individually or globally | Markets re-open; SUSP badges clear for users |
+
+---
+
+## 13 — STRATEGIC DIFFERENTIATORS
+
+| # | Differentiator | Gap Closed | Competitor Status |
+|---|---|---|---|
+| 1 | **Cloudflare Durable Objects per-match WebSocket hub** | Eliminates centralized WebSocket bottleneck; 50,000+ concurrent connections per live match auto-scale without pre-provisioning | All major competitors use Node.js clusters or Redis pub/sub requiring manual scaling and infrastructure management |
+| 2 | **Opaque KV session tokens with instant revocation** | Admin can ban or suspend a user and their access is revoked on the next request (~1–2 seconds) with no JWT residual window | JWT-based platforms have 15-minute revocation lag; PHP session platforms require Redis flush scripts |
+| 3 | **Admin-provisioned accounts only with per-user risk limits** | Operator maintains complete control over who can bet and how much; no anonymous sign-ups | Most platforms allow self-registration; per-user limit configuration requires admin UI that most white-label panels lack |
+| 4 | **Atomic double-entry ledger** | Every balance mutation is transactionally consistent; `SUM(transactions.amount) = wallet.balance` verifiable at all times | Script-based panels update balance with non-transactional `UPDATE balance = balance - stake` calls vulnerable to race conditions |
+| 5 | **Sub-50ms odds delivery from edge** | Users on any continent receive live odds changes in under 50ms via DO broadcast; no polling required | Polling-based platforms (30–60 second refresh intervals) create stale odds arbitrage opportunities and poor UX |
+| 6 | **4-layer /sgyt admin access protection** | Admin panel is invisible to non-whitelisted IPs at the WAF layer before any Worker code runs | Standard panels rely on a single username/password login with no IP restriction or Zero Trust identity gate |
+| 7 | **Cloudflare-native full-stack — zero VM management** | Entire platform runs on Cloudflare Workers, Pages, KV, DO, Queues, R2, and D1; no server provisioning, no load balancers, no autoscaling groups | All enterprise competitors require VMs, cloud load balancers, and infrastructure management; script panels require shared hosting |
+| 8 | **Auto-market suspension on in-play events** | Markets suspend within 50ms of a goal or wicket; no admin action required | Competitors require manual admin intervention or expensive real-time rule engines; PHP panels have no auto-suspension |
+
+---
+
+## 14 — USER STORIES BY PERSONA
+
+### Persona 1 — Super Admin
+
+| Story ID | User Story | Module |
+|---|---|---|
+| US-01 | As a Super Admin, I want to see live total platform liability on the dashboard so that I can make immediate odds or suspension decisions during a high-volume match | Admin Dashboard |
+| US-02 | As a Super Admin, I want to suspend all markets with a single kill switch so that I can react instantly to a data feed failure or suspicious betting pattern | Odds Management |
+| US-03 | As a Super Admin, I want to view an immutable audit log of every admin action so that I can investigate any disputed settlement or wallet change | Audit Log |
+| US-04 | As a Super Admin, I want to re-settle a market with a corrected result so that I can fix settlement errors without losing financial integrity | Bet Management |
+| US-05 | As a Super Admin, I want to export a GGR report by sport for any date range so that I can track platform revenue by vertical | Analytics & Reports |
+| US-06 | As a Super Admin, I want to manually credit or debit a user's wallet with a reason note so that I can handle disputes and goodwill adjustments | Wallet Management |
+
+### Persona 2 — Agent
+
+| Story ID | User Story | Module |
+|---|---|---|
+| US-07 | As an Agent, I want to create a new user account with configured betting limits so that I can onboard players without contacting the Super Admin | User Management |
+| US-08 | As an Agent, I want to approve deposit requests for my assigned users so that they can fund their accounts quickly | Wallet Management |
+| US-09 | As an Agent, I want to view the P&L of each user I manage so that I can flag high-winning users for limit review | User Profile |
+| US-10 | As an Agent, I want to reset a user's password when they are locked out so that I can resolve access issues independently | User Management |
+
+### Persona 3 — Standard Betting User
+
+| Story ID | User Story | Module |
+|---|---|---|
+| US-11 | As a User, I want to see live cricket odds update in real time without refreshing the page so that I can place bets at the best available price | Realtime Live Match Engine |
+| US-12 | As a User, I want my bet slip to persist my selections across page navigation so that I don't lose my accumulator while checking scores | Betting Frontend |
+| US-13 | As a User, I want to cash out my open bet for a guaranteed return before the match ends so that I can lock in profit or reduce loss | Wallet & Ledger System |
+| US-14 | As a User, I want to see my running P&L in my betting history so that I know my net position at any time | Betting Frontend |
+| US-15 | As a User, I want to receive an instant notification when my bet is settled so that I know my outcome without checking manually | Betting Frontend |
+| US-16 | As a User, I want to submit a withdrawal request and track its status so that I can manage my funds transparently | Wallet & Ledger System |
+
+### Persona 4 — Read-Only Admin / Risk Analyst
+
+| Story ID | User Story | Module |
+|---|---|---|
+| US-17 | As a Risk Analyst, I want to see all fraud-flagged bets in a single queue so that I can review them efficiently during a live match | Risk & Fraud Engine |
+| US-18 | As a Risk Analyst, I want to view per-market liability in real time so that I can alert the Super Admin when a market approaches its exposure limit | Admin Dashboard |
+| US-19 | As a Risk Analyst, I want to export a fraud report for a selected date range so that I can compile a weekly risk review | Analytics & Reports |
+
+---
+
+## 15 — FUNCTIONAL REQUIREMENTS SUMMARY [P0/P1/P2]
+
+| ID | Requirement | Module | Priority |
+|---|---|---|---|
+| FR-01 | The system must reject any bet placement request if the market's KV suspension flag is set, before executing any database query | Realtime Engine | P0 |
+| FR-02 | The system must deduct bet stake and create a transaction record atomically within a single database transaction; partial wallet mutation must be impossible | Wallet & Ledger | P0 |
+| FR-03 | The system must invalidate all KV sessions for a user within 2 seconds of an admin suspend action | Authentication | P0 |
+| FR-04 | The system must hash all passwords with Argon2id (memoryCost: 65536, timeCost: 3) before DB storage; plaintext passwords must never be persisted | Authentication | P0 |
+| FR-05 | The system must block all requests to `/sgyt/*` from IPs not on the admin allowlist at the Cloudflare WAF layer | Admin Panel | P0 |
+| FR-06 | The system must broadcast odds updates to all connected WebSocket clients of a match within 50ms of receipt from the external feed | Realtime Engine | P0 |
+| FR-07 | The system must enforce per-user `max_bet`, `max_bet_per_day`, `max_win_per_day`, and `allowed_sports` limits synchronously before accepting any bet | Risk Engine | P0 |
+| FR-08 | The system must write an audit log entry for every admin action including `before` and `after` state snapshots | Admin Panel | P0 |
+| FR-09 | The system must automatically suspend all markets for a match within 50ms of receiving a wicket (cricket) or goal (football) event | Realtime Engine | P0 |
+| FR-10 | The system must reject login attempts exceeding 5 per IP within a 15-minute window with HTTP 429 and a lockout duration | Authentication | P0 |
+| FR-11 | The system must support multi-bet/parlay bet slips with combined odds calculation and a single combined stake | Betting Frontend | P0 |
+| FR-12 | The system must calculate cashout value using the formula `(current_odds / original_odds) × stake × (1 - cashout_margin)` and block cashout if the value is ≤ 0 | Wallet & Ledger | P0 |
+| FR-13 | The system must process bet settlement at a minimum rate of 400 bets per second via Cloudflare Queues with batch size of 10 | Realtime Engine | P0 |
+| FR-14 | The system must assign a risk score between 0.0 and 1.0 to every bet before acceptance and flag any bet with score > 0.7 for admin review | Risk Engine | P1 |
+| FR-15 | The system must support all four sports (Cricket, Football, Tennis, Volleyball) with sport-specific live scoreboard components | Betting Frontend | P1 |
+| FR-16 | The system must allow admins to export all analytics reports as CSV files stored in Cloudflare R2 | Admin Panel | P1 |
+| FR-17 | The system must perform Cloudflare KV liability checks before accepting a bet that would push selection exposure beyond `market.max_liability` | Risk Engine | P1 |
+| FR-18 | The system must provide a real-time AdminBroadcastDO WebSocket feed of live incoming bets to the admin dashboard | Admin Panel | P1 |
+| FR-19 | The system must store device fingerprints on login and flag sessions where the fingerprint changes significantly as suspicious | Authentication | P1 |
+| FR-20 | The system must provide paginated transaction history for each user filterable by type, date range, and reference | Wallet & Ledger | P1 |
+| FR-21 | The system must apply margin to all external odds before publishing: `final_odds = raw_odds × (1 - margin%)` | Realtime Engine | P1 |
+| FR-22 | The system must write all audit logs to Cloudflare R2 as append-only NDJSON via the audit-log-queue; no audit log purge endpoint accessible via API | Admin Panel | P1 |
+| FR-23 | The system must support async fraud analysis via the fraud-analysis-queue without blocking bet acceptance latency | Risk Engine | P2 |
+| FR-24 | The system must allow the admin to configure auto-suspend window durations per sport via ADM-18 Admin Settings | Admin Panel | P2 |
+| FR-25 | The system must display a running P&L total on the user's Betting History page for any selected filter period | Betting Frontend | P2 |
+
+---
+
+## 16 — NON-FUNCTIONAL REQUIREMENTS [P0]
+
+| Category | Requirement | Standard |
+|---|---|---|
+| **Performance** | API response time (core endpoints: bet placement, odds fetch, wallet balance) | 95th percentile under 300ms globally |
+| **Performance** | WebSocket odds broadcast latency from external feed receipt to client delivery | Under 50ms for 95th percentile |
+| **Performance** | Bet settlement throughput | Minimum 400 bets/second via Cloudflare Queues (batch size 10) |
+| **Performance** | Page load time (initial authenticated lobby load) | Under 2 seconds on a 4G mobile connection |
+| **Security** | Password hashing algorithm | Argon2id with memoryCost=65536, timeCost=3, parallelism=4, outputLen=32 |
+| **Security** | Session token entropy | 256-bit random via `crypto.getRandomValues(32)` |
+| **Security** | Cookie security attributes | HttpOnly=true, Secure=true, SameSite=Strict, Path=/, Max-Age=86400 |
+| **Security** | Admin session TTL | 8 hours (shorter than user 24-hour TTL) |
+| **Security** | TLS version | TLS 1.3 minimum in transit |
+| **Security** | Data encryption at rest | AES-256 via PlanetScale/D1 default encryption |
+| **Security** | Content Security Policy | `default-src 'self'; script-src 'self' 'nonce-{random}'; frame-ancestors 'none'` |
+| **Reliability** | Platform uptime SLA | 99.9% (maximum 8.7 hours unplanned downtime per year) |
+| **Reliability** | Settlement Worker availability | 99.95% (settlement backlog must not exceed 1,000 pending bets for more than 5 minutes) |
+| **Reliability** | KV session data durability | Cloudflare KV replication guarantees; session loss triggers re-login, not data loss |
+| **Reliability** | Bet placement idempotency | Duplicate bet requests with the same idempotency key within a 60-second window return the original bet record without creating a duplicate |
+| **Scalability** | Concurrent WebSocket connections per match | Support 50,000 concurrent connections via a single MatchDO; shard to `match:{matchId}:shard{0-9}` pattern for > 100,000 |
+| **Scalability** | Concurrent authenticated users (platform-wide) | Support 10,000 concurrent authenticated user sessions (Phase 1); architecture accommodates 100,000 without rework |
+| **Scalability** | Database write throughput (Phase 1) | Cloudflare D1 + PlanetScale hybrid; D1 for reference data, PlanetScale for financial writes; PlanetScale handles > 100 writes/second with branching-safe migrations |
+| **Compliance** | Audit log retention | All audit logs retained in R2 for minimum 5 years; non-deletable via API |
+| **Compliance** | Transaction record retention | All ledger transaction records retained for minimum 7 years; append-only, no delete endpoint |
+| **Compliance** | Geo-restriction | Cloudflare WAF geo-block for countries where operation is illegal; configurable allowed jurisdiction list |
+| **Accessibility** | Admin panel | WCAG 2.1 AA compliance on all /sgyt web surfaces |
+| **Observability** | Error tracking | Sentry Workers SDK integration; all Worker exceptions captured with trace context |
+| **Observability** | Business metric alerting | PagerDuty/Telegram alerts for: settlement queue > 1,000, Worker error rate > 1%, external API unavailable > 60s |
+| **Observability** | Admin alerting | Telegram alert for: single-user liability > 80% of market limit, fraud score cluster detected, login failure rate spike |
+
+---
+
+## 17 — ASSUMPTIONS AND DEPENDENCIES
+
+### Assumptions
+
+| ID | Assumption | Risk if Wrong |
+|---|---|---|
+| A-01 | Users access the platform from jurisdictions where the operator holds appropriate permissions; geo-restriction is a compliance aid, not a legal substitute | Platform exposure to regulatory action if jurisdiction assumptions are incorrect |
+| A-02 | EntitySport provides ball-by-ball cricket webhook delivery with < 2 second latency during live IPL and international matches | Cricket live features degrade to polling (30-second delay); cricket live betting experience significantly worsened |
+| A-03 | SportMonks webhook delivery for football events is reliable during peak traffic (Champions League, Premier League); webhook uptime > 99.5% | Football live features fall back to polling; auto-suspension may miss goal events by up to 60 seconds |
+| A-04 | PlanetScale HTTP driver for Cloudflare Workers maintains < 100ms p95 query latency for the primary database region | Bet placement latency exceeds the 300ms P95 target; requires migration to Neon or co-located DB |
+| A-05 | Cloudflare Durable Objects are co-located with the primary PlanetScale database region (or within 20ms network latency) | Bet placement requires DO → DB round trip adding up to 40ms additional latency |
+| A-06 | The operator's admin user base (agents and admins) accesses the platform from known, stable IP addresses suitable for WAF allowlisting | /sgyt WAF IP rule blocks legitimate admin access when agents work from new locations; requires a Zero Trust fallback (Cloudflare Access) |
+| A-07 | Phase 1 operates as a single-currency (INR) platform; no multi-currency requirements exist before Phase 2 | Multi-currency conversion logic required mid-development if incorrect |
+
+### Dependencies
+
+| ID | Dependency | Owner | Status |
+|---|---|---|---|
+| D-01 | EntitySport API account — ball-by-ball cricket live data feed with webhook support | EntitySport | Pending — requires API agreement and webhook configuration |
+| D-02 | SportMonks API account — football live events with webhook push | SportMonks | Pending — requires API agreement |
+| D-03 | API-Sports account — Tennis and Volleyball live data (polling fallback) | API-Sports | Pending |
+| D-04 | PlanetScale database account — primary relational DB; requires HTTP driver compatible with Cloudflare Workers | PlanetScale / Internal | Pending |
+| D-05 | Cloudflare Workers Paid Plan — required for Durable Objects, Queues, and R2 beyond free tier limits | Cloudflare | Pending |
+| D-06 | Domain and DNS configuration on Cloudflare (`worldgaming.eu.org`, `api.worldgaming.eu.org`, `ws.worldgaming.eu.org`) | Internal | Pending |
+| D-07 | Admin IP allowlist — list of static IP addresses for WAF /sgyt rule | Operator | Pending |
+| D-08 | Sentry account — Workers SDK exception tracking | Sentry | Pending |
+| D-09 | GitHub repository and Actions CI/CD pipeline configured with Wrangler secrets | Internal | In Progress |
+
+---
+
+## 18 — SUCCESS METRICS AND KPIS
+
+### Adoption Metrics
+
+| Metric | Target | How Measured |
+|---|---|---|
+| Active user accounts at end of Phase 1 pilot (30 days post-launch) | 100+ provisioned accounts | DB `users` table count |
+| Admin accounts created and actively using /sgyt | 5+ distinct admin roles populated | `login_attempts` table, admin role filter |
+| Bet placement conversion rate (users who visit match page and place ≥ 1 bet per session) | > 60% | Bet count / authenticated sessions ratio |
+
+### Operational Value Metrics
+
+| Metric | Description and Target |
+|---|---|
+| Live odds broadcast latency | Average time from external feed receipt to client WebSocket delivery — target under 50ms at p95 during live IPL match |
+| Bet placement end-to-end latency | Average time from user clicking "Confirm" to "Bet Placed ✓" toast — target under 400ms at p95 |
+| Settlement processing lag | Average time from match result entry to 100% of bets settled — target under 60 seconds for ≤ 5,000 bets |
+| Admin suspension-to-lockout time | Average time from admin clicking "Suspend Account" to user's next request returning 401 — target under 3 seconds |
+| Zero financial integrity failures | Sum of all `transactions.amount` per user must equal `wallet.balance` at all times — target 0 discrepancies in any ledger audit |
+
+### Retention and Satisfaction Metrics
+
+| Metric | Description and Target |
+|---|---|
+| Weekly Active Users (WAU) | % of provisioned users placing ≥ 1 bet per week during live cricket season — target > 70% |
+| Admin Daily Active Usage | Admin panel sessions per day during live match periods — target > 3 distinct admin sessions per live match day |
+| Platform Error Rate | HTTP 5xx rate on the API Worker — target < 0.1% of all requests |
+| Settlement Accuracy Rate | % of bets settled with correct outcome on first pass (no re-settlement required) — target > 99.9% |
+
+---
+
+## 19 — OUT OF SCOPE — PHASE 2 ROADMAP
+
+| Feature | Description |
+|---|---|
+| **Payment Gateway Integration** | Automated deposit and withdrawal processing via Razorpay, PayU, or UPI gateway; replaces the current manual admin-approval deposit/withdrawal flow |
+| **Native Mobile Applications** | iOS and Android apps built with React Native or Flutter; WebSocket client patterns validated in Phase 1 web transfer directly to native |
+| **Self-Service User Registration** | Public-facing sign-up with KYC document upload and verification; requires integration with an identity verification service (e.g., Digio, IDfy) |
+| **Automated Odds Pricing Engine** | ML-based odds generation from historical market data, live feed reference odds, and liability balancing; replaces manual admin odds with data-driven lines |
+| **Advanced Analytics Dashboard** | GGR/NGR trending over time, cohort analysis, hold percentage by market type, predictive liability modelling, user lifetime value metrics |
+| **Multi-Currency Wallet** | GBP, EUR, USD denomination support; FX conversion at wallet credit/debit time with admin-configurable exchange rates |
+| **User-Facing Responsible Gambling Controls** | User self-exclusion portal, cooling-off period requests, deposit limit configuration directly accessible by the user (not just admin) |
+| **Wagon Wheel Visualisation (Cricket)** | WebGL-based shot placement visual for cricket live scoreboards; deferred due to rendering complexity outside core MVP scope |
+| **Enhanced Fraud ML Model** | Replace rule-based fraud detection with a trained gradient boosted classifier on historical bet and user behaviour data |
+| **SuperAgent Hierarchy** | Sub-agent levels below Agent; agent commission tracking and automated agent P&L reporting |
+
+> **Architecture note:** The Phase 1 database schema, KV key namespaces, and Durable Object interfaces are designed to accommodate all Phase 2 features listed above without requiring a schema migration or architectural rebuild. Specifically: the `users` table has an `agent_id` foreign key placeholder for the SuperAgent hierarchy; the `wallets` table has a `currency` field for multi-currency; and the `transactions` table has a `fx_rate` column pre-defined as nullable.
+
+---
+
+## 20 — OPEN QUESTIONS AND DECISIONS
+
+| ID | Question | Context |
+|---|---|---|
+| OQ-01 | Should PlanetScale or Cloudflare D1 be used as the primary database for Phase 1? | D1 is simpler to deploy but has a ~100 writes/second ceiling and ~100–200ms write latency for non-primary-region Workers. PlanetScale has higher write throughput and global read replicas but requires the `@planetscale/database` HTTP driver. The decision affects bet placement latency and scaling headroom. Default recommendation: PlanetScale for financial tables, D1 for reference data. This must be decided before database schema migration scripts are written. |
+| OQ-02 | What is the admin IP allowlist for the /sgyt WAF rule? | The WAF rule blocking /sgyt from non-admin IPs requires a known set of static IPs. If the operator's admin team works from dynamic IP addresses (e.g., home connections, mobile data), Cloudflare Zero Trust (Cloudflare Access with email OTP) must be the primary gate and the IP rule must be relaxed or removed. This must be decided before production WAF rules are deployed. |
+| OQ-03 | What is the cashout margin percentage? | The cashout formula includes `(1 - cashout_margin)`. This is a business decision, not a technical one. The default in the research is unspecified. A margin of 5–10% is typical. This value must be confirmed before the cashout feature is deployed so that it is correctly reflected in the user-facing confirmation modal. |
+| OQ-04 | Should bets with risk_score > 0.7 be blocking (rejected) or non-blocking (flagged but accepted) by default? | Non-blocking (accept and flag) is recommended for Phase 1 to avoid false positives that hurt user experience during platform calibration. However, some operators prefer blocking high-risk bets above a configurable threshold. This must be decided as a configurable platform setting in ADM-18 before go-live. |
+| OQ-05 | What is the minimum withdrawal amount and the withdrawal processing SLA communicated to users? | The minimum withdrawal amount must be set in admin settings (default suggestion: ₹500). The SLA (e.g., "withdrawals processed within 24 hours") must be agreed with the operator and reflected in the user-facing withdrawal flow. |
+
+---
+
+## 21 — GLOSSARY
+
+| Term | Definition |
+|---|---|
+| **Accumulator / Parlay** | A multi-selection bet where all selections must win for the bet to return a profit; combined odds are the product of all individual selection odds |
+| **AdminBroadcastDO** | The AdminBroadcast Durable Object — a singleton per platform that manages WebSocket connections for all admin dashboard sessions and broadcasts live bet flow and risk events |
+| **Argon2id** | The OWASP-recommended password hashing algorithm used in WorldGaming; memory-hard, combining GPU-resistance (Argon2d) and side-channel resistance (Argon2i) |
+| **BettingSlipDO** | The BettingSlip Durable Object — one instance per active user session; acts as a distributed lock to prevent double-submission race conditions during bet placement |
+| **Cashout** | A feature allowing a user to settle an open bet before the market result is known, in exchange for a guaranteed partial return based on current odds |
+| **D1** | Cloudflare D1 — a SQLite-compatible relational database running at the Cloudflare edge, used for reference data, audit logs, and low-write-volume tables |
+| **Durable Object (DO)** | A Cloudflare compute primitive providing strongly consistent, stateful singleton JavaScript objects with built-in WebSocket support; used in WorldGaming for per-match WebSocket hubs |
+| **Feed Normalizer Worker** | A Cloudflare Worker that translates all external sports API payloads into the unified internal event schema `{ matchId, sport, eventType, data, timestamp }` |
+| **GGR** | Gross Gaming Revenue — total stakes received minus total winnings paid out, before operating costs |
+| **Hono** | A lightweight TypeScript web framework designed for Cloudflare Workers; used as the API layer in WorldGaming |
+| **HttpOnly cookie** | A browser cookie attribute preventing JavaScript access; used for `sess_token` so that XSS attacks cannot steal session tokens |
+| **KV (Cloudflare KV)** | Cloudflare's key-value store used in WorldGaming for sessions, odds cache, market suspension flags, rate limit counters, and market liability |
+| **Kill Switch** | The admin control that suspends all open markets across all sports platform-wide simultaneously; available on ADM-18 Admin Settings |
+| **Liability** | The total maximum payout the platform would owe if all currently open bets on a selection or market win simultaneously |
+| **Market** | A specific betting proposition within a match (e.g., "Match Winner", "First Innings Runs", "Over 2.5 Goals"); a match can have multiple markets |
+| **MatchDO** | The Match Durable Object — one singleton per live match that manages all WebSocket connections watching that match and broadcasts score and odds updates |
+| **NGR** | Net Gaming Revenue — GGR minus bonuses paid and any applicable payment processing fees |
+| **Opaque session token** | A random, meaningless string used as a session identifier; stored in Cloudflare KV; the client cannot decode it to determine any user information |
+| **Overround / Margin** | The bookmaker's built-in profit margin; if all selection probabilities implied by the odds sum to more than 100%, the excess is the overround |
+| **PlanetScale** | A MySQL-compatible serverless database with horizontal sharding via Vitess; used as the primary financial database in WorldGaming via its HTTP driver compatible with Cloudflare Workers |
+| **Selection** | An individual outcome within a market that a user can bet on (e.g., "India", "Draw", "Pakistan") with an associated odds value |
+| **Settlement** | The process of evaluating an accepted bet against the final market result, crediting winnings, or recording a loss after a match is completed |
+| **/sgyt** | The hidden URL path serving the WorldGaming admin panel; chosen to be non-obvious to reduce attack surface; blocked at WAF for non-admin IPs |
+| **SUSP badge** | The visual indicator shown on a market or selection when its status is `suspended`; users cannot add suspended selections to their bet slip |
+| **Wrangler** | The Cloudflare CLI tool used to deploy Workers, Pages, and D1 migrations; used in the GitHub Actions CI/CD pipeline |
+| **Zod** | A TypeScript-first schema validation library; all API request bodies in WorldGaming are validated with Zod before reaching any business logic or DB query |
+
+---
+
+
+---
+
+## 23 — CODEX GENERATION CHECKLIST
+
+> Use this checklist to verify generated files before committing.
+
+### Pre-Bet-Placement Verification (P0 — Every generated `betsRouter.ts` must satisfy all)
+- [ ] `SUSPENDED_MARKETS.get(`susp:${matchId}`, { cacheTtl: 0 })` called **before** any DB query
+- [ ] `BettingSlipDO.acquireLock(idempotencyKey)` called before wallet debit
+- [ ] `walletService.debit()` is the **only** path that writes to `wallets` table
+- [ ] `transactions` INSERT is inside the same PlanetScale transaction as `wallets` UPDATE
+- [ ] `fraud-analysis-queue.send()` called **after** COMMIT, never before
+- [ ] Response is `201 { betId, status: "accepted" }` — never include `balance` in bet response
+
+### Auth Verification (P0 — Every generated middleware must satisfy all)
+- [ ] All KV session reads use `{ cacheTtl: 0 }` option
+- [ ] `sess_token` cookie attributes: `HttpOnly; Secure; SameSite=Strict`
+- [ ] Admin IP hash comparison executes on every `/sgyt/*` request
+- [ ] `user_sessions:{userId}` index updated on every new session creation
+
+### Wallet Verification (P0 — Every generated wallet mutation must satisfy all)
+- [ ] `SELECT ... FOR UPDATE` precedes every `UPDATE wallets`
+- [ ] `balance_before` and `balance_after` stored on every `transactions` row
+- [ ] `transactions` table is INSERT-only — no UPDATE or DELETE paths generated
+- [ ] Withdrawal request sets `pending_withdrawal` field atomically with request creation
+
+### Audit Verification (P0 — Every generated admin route must satisfy all)
+- [ ] `auditService.logAction()` called with `before` and `after` state snapshots
+- [ ] D1 write is **synchronous** (awaited before response)
+- [ ] Audit queue publish is fire-and-forget (not awaited)
+
+### Security Verification (P0)
+- [ ] No secret values in `wrangler.toml` — all via `wrangler secret put`
+- [ ] No raw `c.req.json()` — all bodies through `@hono/zod-validator`
+- [ ] No `console.error` — all exceptions via `Sentry.captureException()`
+- [ ] CORS origin is strictly `https://worldgaming.eu.org`
+
+---
+
+## 22 — DOCUMENT SIGN-OFF
+
+This document must be signed before development begins. Changes after sign-off require a formal change request reviewed by the Product Lead and Frontend/Backend Leads.
+
+| Role | Name | Signature | Date |
+|---|---|---|---|
+| **Product Lead** | SlayerGamerYT | ________________________ | ___________ |
+| **Frontend Lead** | [Name] | ________________________ | ___________ |
+| **Backend Lead** | [Name] | ________________________ | ___________ |
+| **QA Lead** | [Name] | ________________________ | ___________ |
+| **Risk / Security Lead** | [Name] | ________________________ | ___________ |
+
+---
+
+*WorldGaming PRD — v1.0 · Phase 1 Core Platform · Codex-Refined Edition*
+*Architecture: Cloudflare Workers + Pages + KV + Durable Objects + Queues + R2 + PlanetScale*
+*Generated from: SGYT Corp. Sportsbook Deep Technical Research v1.0*
+*All [bracketed placeholders] must be completed before sharing with any engineering team member.*
