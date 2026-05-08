@@ -1,0 +1,23 @@
+<!doctype html>
+<html>
+<head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>WorldGaming Admin</title></head>
+<body>
+  <h1>WorldGaming — Admin (/sgyt)</h1>
+  <p>Demo creds: <code>admin / admin123</code></p>
+  <form id="loginForm">
+    <input id="username" value="admin" />
+    <input id="password" type="password" value="admin123" />
+    <button>Login</button>
+  </form>
+  <button id="meBtn">Current Admin</button>
+  <button id="marketsBtn">View Markets</button>
+  <pre id="out"></pre>
+<script>
+const API = localStorage.getItem('wg_api') || 'http://127.0.0.1:8787';
+async function api(path, init={}) { const r=await fetch(API+path,{credentials:'include',headers:{'content-type':'application/json'},...init}); return r.json(); }
+loginForm.onsubmit=async(e)=>{e.preventDefault(); out.textContent=JSON.stringify(await api('/v1/auth/login',{method:'POST',body:JSON.stringify({username:username.value,password:password.value})}),null,2)};
+meBtn.onclick=async()=>{out.textContent=JSON.stringify(await api('/v1/me'),null,2)};
+marketsBtn.onclick=async()=>{out.textContent=JSON.stringify(await api('/v1/markets'),null,2)};
+</script>
+</body>
+</html>

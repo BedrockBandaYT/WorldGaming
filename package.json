@@ -1,0 +1,16 @@
+{
+  "name": "worldgaming",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "workers/*",
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "typecheck": "npm run -ws typecheck",
+    "lint": "npm run -ws lint",
+    "deploy:api": "npm --workspace @worldgaming/api-worker run deploy",
+    "dev:api": "npm --workspace @worldgaming/api-worker run dev"
+  }
+}

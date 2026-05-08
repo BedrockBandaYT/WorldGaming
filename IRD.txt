@@ -1,0 +1,1820 @@
+# IMPLEMENTATION REQUIREMENTS DOCUMENT
+## WorldGaming — Phase 1 Core Platform
+### Cloudflare-Native Sports Betting Platform
+**Version 1.0 · May 2026 · Based on PRD v1.0**
+
+---
+
+## DOCUMENT INFORMATION
+
+| Field | Detail |
+|---|---|
+| **Product** | WorldGaming |
+| **Document Type** | Implementation Requirements Document (IRD) |
+| **Version** | 1.0 |
+| **Phase** | Phase 1 — Core Platform |
+| **Status** | Pre-Development |
+| **Derived From** | WorldGaming PRD v1.0 — May 2026 |
+| **Target Teams** | Backend, Frontend, DevOps, QA |
+| **Architecture** | Cloudflare Workers + Pages + KV + Durable Objects + Queues + R2 + PlanetScale (primary) + D1 (reference/audit) |
+
+---
+
+## TABLE OF CONTENTS
+
+| # | Section |
+|---|---|
+| 1 | System Architecture Overview |
+| 2 | Service and Module Architecture |
+| 3 | Cloudflare Deployment Architecture |
+| 4 | Worker and Durable Object Responsibilities |
+| 5 | Backend Implementation Structure |
+| 6 | Folder Structure |
+| 7 | Database Schema and Relationships |
+| 8 | KV Namespace Design |
+| 9 | Authentication and Session Implementation |
+| 10 | WebSocket and Realtime Implementation |
+| 11 | Feed Ingestion Implementation |
+| 12 | Betting Engine Implementation |
+| 13 | Wallet and Transaction Handling |
+| 14 | Admin System Implementation |
+| 15 | Risk and Fraud Engine Implementation |
+| 16 | API Specifications |
+| 17 | Validation and Security Implementation |
+| 18 | Rate Limiting and Anti-Abuse Systems |
+| 19 | Queue and Event Processing |
+| 20 | State Management Strategy |
+| 21 | Error Handling Standards |
+| 22 | Logging and Monitoring Implementation |
+| 23 | Environment Structure |
+| 24 | DevOps and CI/CD Workflow |
+| 25 | Testing Strategy |
+| 26 | Scalability Considerations |
+| 27 | Failure Recovery Handling |
+| 28 | Edge-Case Handling |
+
+---
+
+## 1 — SYSTEM ARCHITECTURE OVERVIEW
+
+### 1.1 Architecture Philosophy
+
+WorldGaming is a fully edge-native platform — every component runs on Cloudflare's global network. There are no VMs, no load balancers, and no manually scaled infrastructure. The system is designed on three structural principles derived directly from the PRD:
+
+1. **Edge-first, server-last** — Hot data (sessions, odds, suspension flags, liability) lives in KV and Durable Objects at the Cloudflare edge. PlanetScale is the system of record, not the critical path for live reads.
+2. **Fail closed on suspension** — KV suspension flag reads precede all database queries in the bet placement pipeline. A suspended market costs < 1ms to reject; it does not touch PlanetScale.
+3. **Atomic money, always** — Every wallet mutation executes inside a PlanetScale database transaction. Partial writes are architecturally impossible.
+
+### 1.2 High-Level System Diagram
+
+```mermaid
+graph TD
+    subgraph "User Clients"
+        UC[React SPA — worldgaming.eu.org]
+        UA[Admin SPA — worldgaming.eu.org/sgyt]
+    end
+
+    subgraph "Cloudflare Edge"
+        WAF[Cloudflare WAF\nIP Allowlist / Geo-block / /sgyt Gate]
+        Pages[Cloudflare Pages\nStatic SPA Hosting]
+        
+        subgraph "Workers"
+            APIw[API Worker\nHono — api.worldgaming.eu.org]
+            WSw[WebSocket Worker\nws.worldgaming.eu.org]
+            FeedW[Feed Ingestion Worker\nScheduled + Webhook]
+            SettleW[Settlement Worker\nQueue Consumer]
+            FraudW[Fraud Analysis Worker\nQueue Consumer]
+            AuditW[Audit Log Worker\nQueue Consumer]
+            ReportW[Report Generation Worker\nOn-Demand + Scheduled]
+        end
+
+        subgraph "Durable Objects"
+            MatchDO[MatchDO\nPer-Match WS Hub]
+            OddsEngDO[OddsEngineDO\nPer-Sport Odds Processing]
+            BetSlipDO[BettingSlipDO\nPer-User Session Lock]
+            AdminDO[AdminBroadcastDO\nAdmin WS Hub]
+        end
+
+        subgraph "Cloudflare Storage"
+            KV_SESS[KV: SESSIONS]
+            KV_ADM[KV: ADMIN_SESSIONS]
+            KV_ODDS[KV: ODDS_CACHE]
+            KV_SUSP[KV: SUSPENDED_MARKETS]
+            KV_LIA[KV: MARKET_LIABILITY]
+            KV_RL[KV: RATE_LIMITS]
+            R2[R2: Audit Logs + Reports]
+            D1[D1: Reference Data\nAudit Log + Odds History]
+        end
+
+        subgraph "Queues"
+            SQ[settlement-queue]
+            FQ[fraud-analysis-queue]
+            AQ[audit-log-queue]
+        end
+    end
+
+    subgraph "External Services"
+        PS[(PlanetScale\nFinancial DB)]
+        ES[EntitySport API\nCricket]
+        SM[SportMonks API\nFootball]
+        AS[API-Sports\nTennis / Volleyball]
+        Sentry[Sentry\nError Tracking]
+        PD[PagerDuty / Telegram\nAlerts]
+    end
+
+    UC -- HTTPS --> WAF
+    UA -- HTTPS --> WAF
+    WAF --> Pages
+    WAF --> APIw
+    WAF --> WSw
+    APIw --> KV_SESS
+    APIw --> KV_SUSP
+    APIw --> PS
+    APIw --> D1
+    APIw --> BetSlipDO
+    APIw --> SQ
+    APIw --> FQ
+    APIw --> AQ
+    WSw --> MatchDO
+    WSw --> AdminDO
+    MatchDO --> KV_ODDS
+    MatchDO --> KV_SUSP
+    OddsEngDO --> KV_ODDS
+    OddsEngDO --> KV_LIA
+    OddsEngDO --> MatchDO
+    FeedW --> OddsEngDO
+    FeedW --> MatchDO
+    ES --> FeedW
+    SM --> APIw
+    APIw --> FeedW
+    SettleW --> PS
+    SettleW --> AdminDO
+    FraudW --> D1
+    FraudW --> AdminDO
+    AuditW --> R2
+    ReportW --> PS
+    ReportW --> R2
+    APIw --> Sentry
+    SettleW --> PD
+```
+
+### 1.3 Domain Structure
+
+| Domain | Service | Purpose |
+|---|---|---|
+| `worldgaming.eu.org` | Cloudflare Pages | User-facing React SPA |
+| `worldgaming.eu.org/sgyt` | Cloudflare Pages (admin route) | Admin SPA — protected by 4-layer security |
+| `api.worldgaming.eu.org` | API Worker (Hono) | All REST API endpoints |
+| `ws.worldgaming.eu.org` | WebSocket Worker | WebSocket upgrade entry point routing to DOs |
+
+---
+
+## 2 — SERVICE AND MODULE ARCHITECTURE
+
+### 2.1 Module Boundaries
+
+| Module | PRD Reference | Workers | Durable Objects | Primary DB | KV Namespaces |
+|---|---|---|---|---|---|
+| **Betting Frontend** | §6 | API Worker | BettingSlipDO | PlanetScale (`bets`, `users`) | SESSIONS, ODDS_CACHE, SUSPENDED_MARKETS |
+| **Realtime Live Match Engine** | §7 | Feed Ingestion Worker, WebSocket Worker | MatchDO, OddsEngineDO | D1 (`odds_history`) | ODDS_CACHE, SUSPENDED_MARKETS, MARKET_LIABILITY |
+| **Wallet & Ledger** | §8 | API Worker | BettingSlipDO | PlanetScale (`wallets`, `transactions`, `deposit_requests`, `withdrawal_requests`) | SESSIONS |
+| **Admin Panel (/sgyt)** | §9 | API Worker | AdminBroadcastDO | PlanetScale + D1 (`audit_log`) | ADMIN_SESSIONS, ODDS_CACHE, SUSPENDED_MARKETS |
+| **Risk & Fraud Engine** | §10 | API Worker (sync), Fraud Analysis Worker (async) | — | D1 (`fraud_flags`) | MARKET_LIABILITY, RATE_LIMITS |
+
+### 2.2 Request Flow — Bet Placement
+
+```mermaid
+sequenceDiagram
+    participant Browser
+    participant WAF as Cloudflare WAF
+    participant API as API Worker (Hono)
+    participant KV
+    participant DO as BettingSlipDO
+    participant PS as PlanetScale
+    participant Q as settlement-queue
+
+    Browser->>WAF: POST /api/bets (with sess_token cookie)
+    WAF->>API: Pass (IP/geo checks passed)
+    API->>KV: GET sess_token → userId, role
+    KV-->>API: Session record
+    API->>KV: GET suspension flag for matchId
+    KV-->>API: Not suspended
+    API->>DO: Acquire lock (idempotency key)
+    DO-->>API: Lock acquired
+    API->>PS: BEGIN TRANSACTION
+    API->>PS: SELECT wallet FOR UPDATE
+    API->>PS: Validate limits, balance
+    API->>PS: UPDATE wallet
+    API->>PS: INSERT transaction
+    API->>PS: INSERT bet
+    API->>PS: COMMIT
+    API->>Q: Publish to fraud-analysis-queue (async)
+    API->>DO: Release lock
+    API-->>Browser: 201 { betId, status: "accepted" }
+```
+
+---
+
+## 3 — CLOUDFLARE DEPLOYMENT ARCHITECTURE
+
+### 3.1 Cloudflare Services Used
+
+| Service | Usage | Configuration |
+|---|---|---|
+| **Workers** | API, WebSocket routing, feed ingestion, queue consumers | Paid plan; ES module format; Hono framework |
+| **Pages** | React SPA hosting (user + admin) | Connected to GitHub repo; auto-deploy on `main` |
+| **Durable Objects** | MatchDO, OddsEngineDO, BettingSlipDO, AdminBroadcastDO | Declared in `wrangler.toml`; Hibernation API enabled |
+| **KV** | Sessions, odds cache, suspension flags, liability, rate limits | 6 namespaces; eventual consistency acceptable for odds cache, strong reads for sessions |
+| **Queues** | Settlement, fraud analysis, audit log | 3 queues; max retries = 3; exponential backoff |
+| **R2** | Audit logs (NDJSON), report CSV exports | Two buckets: `worldgaming-audit-logs`, `worldgaming-reports` |
+| **D1** | Reference data, audit_log table, odds_history, fraud_flags | SQLite; used for low-write-volume tables |
+| **WAF (Custom Rules)** | `/sgyt` IP allowlist, geo-blocking, rate limiting | Configured via Cloudflare dashboard and Terraform |
+| **Cloudflare Access** | Zero Trust gate for `/sgyt/*` (Layer 2 admin protection) | TOTP / email OTP |
+
+### 3.2 WAF Rule Set
+
+| Rule ID | Match Condition | Action | Priority |
+|---|---|---|---|
+| WAF-01 | URI path contains `/sgyt` AND IP NOT IN `admin_ip_allowlist` | Block (HTTP 403) | 1 |
+| WAF-02 | URI path contains `/sgyt` AND CF Access token absent | Challenge | 2 |
+| WAF-03 | Country NOT IN `allowed_jurisdictions` | Block (HTTP 451) | 3 |
+| WAF-04 | Request rate > 1,000/min per IP on `/api/*` | Rate Limit (HTTP 429) | 4 |
+| WAF-05 | Known bot fingerprint on `/api/auth/login` | Challenge | 5 |
+
+### 3.3 Wrangler Configuration Overview
+
+```toml
+# FILE: infra/wrangler/wrangler.toml
+# CODEX: Set node_compat = true for @node-rs/argon2 WASM.
+# CODEX: Enable durable_objects migration tag on first deploy.
+# CODEX: All secret values via `wrangler secret put` — never inline here.
+name = "worldgaming-api"
+main = "src/worker.ts"
+compatibility_date = "2024-09-23"
+
+[[durable_objects.bindings]]
+name = "MATCH_DO"
+class_name = "MatchDurableObject"
+
+[[durable_objects.bindings]]
+name = "ODDS_ENGINE_DO"
+class_name = "OddsEngineDurableObject"
+
+[[durable_objects.bindings]]
+name = "BETTING_SLIP_DO"
+class_name = "BettingSlipDurableObject"
+
+[[durable_objects.bindings]]
+name = "ADMIN_BROADCAST_DO"
+class_name = "AdminBroadcastDurableObject"
+
+[[kv_namespaces]]
+binding = "SESSIONS"
+id = "<prod_id>"
+preview_id = "<dev_id>"
+
+# Repeat for: ADMIN_SESSIONS, ODDS_CACHE, SUSPENDED_MARKETS, MARKET_LIABILITY, RATE_LIMITS, FEED_DEDUP
+
+[[queues.producers]]
+queue = "settlement-queue"
+binding = "SETTLEMENT_QUEUE"
+
+[[queues.producers]]
+queue = "fraud-analysis-queue"
+binding = "FRAUD_QUEUE"
+
+[[queues.producers]]
+queue = "audit-log-queue"
+binding = "AUDIT_QUEUE"
+
+[[queues.consumers]]
+queue = "settlement-queue"
+max_batch_size = 10
+max_batch_timeout = 5
+max_retries = 3
+
+[[r2_buckets]]
+binding = "AUDIT_LOGS"
+bucket_name = "worldgaming-audit-logs"
+
+[[r2_buckets]]
+binding = "REPORTS"
+bucket_name = "worldgaming-reports"
+
+[[d1_databases]]
+binding = "DB_D1"
+database_name = "worldgaming-reference"
+database_id = "<id>"
+```
+
+---
+
+## 4 — WORKER AND DURABLE OBJECT RESPONSIBILITIES
+
+### 4.1 Workers
+
+| Worker | Trigger | Responsibilities |
+|---|---|---|
+| **API Worker** (`worldgaming-api`) | HTTP request to `api.worldgaming.eu.org` | All REST endpoints; auth middleware; session validation; bet placement pipeline; wallet operations; admin CRUD; risk scoring (sync); publishes to all three queues |
+| **WebSocket Worker** (`worldgaming-ws`) | HTTP upgrade at `ws.worldgaming.eu.org` | Session validation from KV; routes WS upgrades to correct MatchDO or AdminBroadcastDO |
+| **Feed Ingestion Worker** (`worldgaming-feed`) | `cron` trigger (5–30s) + webhook endpoint | Polls EntitySport / API-Sports; receives SportMonks webhook; normalises to internal schema; deduplicates via event fingerprint |
+| **Settlement Worker** (`worldgaming-settle`) | `settlement-queue` consumer | Batch processes bet settlement (10 per batch); executes atomic wallet credits; updates bet statuses |
+| **Fraud Analysis Worker** (`worldgaming-fraud`) | `fraud-analysis-queue` consumer | Runs async fraud detection rules; writes `fraud_flags` to D1 |
+| **Audit Log Worker** (`worldgaming-audit`) | `audit-log-queue` consumer | Writes NDJSON audit entries to R2; append-only |
+| **Report Worker** (`worldgaming-report`) | HTTP trigger + daily cron | Queries PlanetScale; generates CSV; stores to R2; returns signed URL |
+
+### 4.2 Durable Objects
+
+#### MatchDurableObject `[P0]`
+- **Identity:** `MatchDO.idFromName("match:{matchId}")`
+- **State:** `matchState` — score, market states, last update timestamp — persisted to DO storage
+- **WebSocket:** Uses Hibernation API (`this.ctx.acceptWebSocket(server)`)
+- **On connect:** Sends `{ type: "init", matchState }` snapshot immediately
+- **Auto-suspension:** On `wicket | goal | set_complete`, writes `susp:{matchId}=true` to KV; sets alarm for auto-reopen
+- **Alarm handler:** Deletes suspension flag from KV; broadcasts `{ type: "market_reopen" }`
+
+#### OddsEngineDurableObject `[P0]`
+- **Identity:** `OddsEngineDO.idFromName("odds:engine:{sport}")`
+- **Responsibilities:** Applies margin (`final = raw × (1 - margin%)`); validates liability ceiling; writes to KV `ODDS_CACHE`; queues D1 write to `odds_history`; calls MatchDO broadcast
+- **Concurrency:** Single-threaded DO prevents margin calculation race conditions
+
+#### BettingSlipDurableObject `[P0]`
+- **Identity:** `BettingSlipDO.idFromName("slip:{userId}")`
+- **Lock flow:** `acquireLock(idempotencyKey)` → checks existing → stores `{ status:"pending" }` with 60s TTL → on success updates to `{ status:"accepted", betId }` → on failure removes entry
+- **Bet delay:** Holds lock during live bet delay (3s default); re-validates odds and suspension before DB write
+
+#### AdminBroadcastDurableObject `[P1]`
+- **Identity:** `AdminBroadcastDO.idFromName("admin:broadcast")` — singleton
+- **Channels:** `bet_placed`, `risk_alert`, `market_suspension`, `fraud_flag`, `pnl_update`
+- **Auth:** Only Workers with `X-Internal-Secret` header can push; admin clients are receive-only
+
+---
+
+## 5 — BACKEND IMPLEMENTATION STRUCTURE
+
+### 5.1 Framework and Runtime
+
+| Concern | Technology |
+|---|---|
+| HTTP Framework | Hono v4 |
+| Language | TypeScript 5 (strict mode) |
+| DB Client (PlanetScale) | `@planetscale/database` HTTP driver |
+| DB Client (D1) | CF Workers D1 binding |
+| Password Hashing | `@node-rs/argon2` (WASM) — Argon2id, memoryCost=65536, timeCost=3, parallelism=4 |
+| Validation | Zod v3 via `@hono/zod-validator` |
+| Error Tracking | `@sentry/cloudflare` |
+
+### 5.2 Hono Middleware Stack (execution order)
+
+```
+1. Sentry error capture
+2. CORS (worldgaming.eu.org origin only, credentials: true)
+3. Request ID (UUID v4 injected into every context)
+4. Rate limit middleware (KV:RATE_LIMITS)
+5. authGuard — reads KV:SESSIONS cacheTtl:0, attaches user to context
+6. adminGuard — checks role for /sgyt/* routes + IP hash validation
+7. Zod body validation (per-route schema)
+8. Route handler
+9. Response formatter (standard JSON envelope)
+```
+
+### 5.3 Route Organisation
+
+```typescript
+// FILE: workers/api/src/worker.ts
+// CODEX: Mount all routers here. Middleware stack must execute in order above.
+app.route("/api/auth",          authRouter)
+app.route("/api/sports",        sportsRouter)
+app.route("/api/matches",       matchesRouter)
+app.route("/api/bets",          betsRouter)
+app.route("/api/wallet",        walletRouter)
+app.route("/api/notifications",  notificationsRouter)
+app.route("/api/sgyt/users",    adminUsersRouter)
+app.route("/api/sgyt/bets",     adminBetsRouter)
+app.route("/api/sgyt/wallet",   adminWalletRouter)
+app.route("/api/sgyt/odds",     adminOddsRouter)
+app.route("/api/sgyt/risk",     adminRiskRouter)
+app.route("/api/sgyt/reports",  adminReportsRouter)
+app.route("/api/sgyt/audit",    adminAuditRouter)
+app.route("/api/sgyt/settings", adminSettingsRouter)
+app.route("/webhooks",          webhooksRouter)
+```
+
+---
+
+## 6 — FOLDER STRUCTURE
+
+```
+worldgaming/
+├── apps/
+│   ├── web/                          # User-facing React SPA (worldgaming.eu.org)
+│   │   └── src/
+│   │       ├── components/
+│   │       │   ├── betting/          # BetSlip, OddsButton, BetConfirmModal, BetDelayModal
+│   │       │   ├── scoreboards/      # Cricket, Football, Tennis, Volleyball
+│   │       │   ├── wallet/           # WalletPage, DepositForm, WithdrawalForm, TransactionList
+│   │       │   ├── notifications/    # NotificationCentre, NotificationBell
+│   │       │   └── layout/           # Header, SportsTabBar, MobileDrawer
+│   │       ├── pages/
+│   │       ├── hooks/
+│   │       │   ├── useWebSocket.ts
+│   │       │   ├── useBetSlip.ts
+│   │       │   └── useAuth.ts
+│   │       ├── store/
+│   │       │   ├── betSlipStore.ts   # Zustand: selections, stakes, accumulator state
+│   │       │   ├── authStore.ts      # Zustand: userId, username, balance
+│   │       │   └── notifStore.ts
+│   │       └── lib/
+│   │           ├── api.ts            # Typed fetch client
+│   │           └── odds.ts           # Payout calculation, accumulator math
+│   │
+│   └── admin/                        # Admin SPA (worldgaming.eu.org/sgyt)
+│       └── src/
+│           ├── components/
+│           │   ├── dashboard/        # KPI cards, RevenueChart, LiabilityHeatmap, BetFlowTicker
+│           │   ├── users/
+│           │   ├── bets/
+│           │   ├── odds/             # OddsEditor, MarketSuspendButton, KillSwitch
+│           │   ├── wallet/           # DepositQueue, WithdrawalQueue, ManualCreditForm
+│           │   └── risk/             # RiskDashboard, FraudFlagQueue, ExposureTable
+│           ├── hooks/
+│           │   └── useAdminWS.ts
+│           └── store/
+│               └── adminStore.ts
+│
+├── packages/
+│   └── types/
+│       ├── api.ts                    # API request/response interfaces
+│       ├── db.ts                     # DB row type interfaces
+│       └── events.ts                 # InternalEvent schema
+│
+├── workers/
+│   ├── api/src/
+│   │   ├── worker.ts
+│   │   ├── middleware/
+│   │   │   ├── authGuard.ts          # [P0] KV session lookup, cacheTtl:0
+│   │   │   ├── adminGuard.ts         # [P0] Role + IP hash enforcement
+│   │   │   ├── rateLimit.ts          # [P0] KV-backed + DO counter for login
+│   │   │   └── requestId.ts
+│   │   ├── routers/
+│   │   ├── services/
+│   │   │   ├── betService.ts         # [P0] Bet placement orchestration
+│   │   │   ├── walletService.ts      # [P0] ONLY path for wallet mutations
+│   │   │   ├── riskService.ts        # [P1] <20ms, no PS reads
+│   │   │   ├── cashoutService.ts     # [P1] Atomic cashout
+│   │   │   ├── sessionService.ts     # [P0] Create/validate/revoke sessions
+│   │   │   └── auditService.ts       # [P0] Sync D1 + async R2 queue
+│   │   ├── db/
+│   │   │   ├── planetscale.ts
+│   │   │   ├── queries/
+│   │   │   └── migrations/
+│   │   └── schemas/                  # Zod schemas per route
+│   │
+│   ├── websocket/src/worker.ts       # [P0] WS routing to MatchDO / AdminDO
+│   ├── feed/src/
+│   │   ├── worker.ts
+│   │   ├── normalizer.ts             # [P0] All feeds → InternalEvent schema
+│   │   ├── deduplicator.ts           # [P0] SHA-256 fingerprint, 300s TTL
+│   │   └── sources/
+│   ├── settlement/src/
+│   │   ├── worker.ts                 # [P0] Queue consumer
+│   │   └── settlementProcessor.ts
+│   ├── fraud/src/
+│   │   ├── worker.ts
+│   │   └── fraudRules.ts             # [P1]
+│   ├── audit/src/worker.ts           # [P1]
+│   └── durable-objects/src/
+│       ├── MatchDurableObject.ts     # [P0]
+│       ├── OddsEngineDurableObject.ts # [P0]
+│       ├── BettingSlipDurableObject.ts # [P0]
+│       └── AdminBroadcastDurableObject.ts # [P1]
+│
+├── infra/
+│   ├── terraform/                    # WAF rules, KV namespace creation
+│   └── wrangler/
+│       ├── wrangler.toml
+│       ├── wrangler.dev.toml
+│       └── wrangler.staging.toml
+│
+└── .github/workflows/
+    ├── deploy-prod.yml
+    ├── deploy-staging.yml
+    └── test.yml
+```
+
+---
+
+## 7 — DATABASE SCHEMA AND RELATIONSHIPS
+
+### 7.1 Database Allocation
+
+| Table Group | Database | Rationale |
+|---|---|---|
+| `users`, `wallets`, `transactions`, `bets`, `bet_selections`, `deposit_requests`, `withdrawal_requests` | **PlanetScale** | Financial tables; ACID transactions; >100 writes/second |
+| `matches`, `markets`, `selections`, `leagues`, `sports` | **D1** | Reference data; low write frequency |
+| `audit_log`, `odds_history`, `fraud_flags`, `login_history`, `notifications` | **D1** | Append-only historical records; <100 writes/second |
+
+### 7.2 PlanetScale Schema `[P0]`
+
+```sql
+-- FILE: workers/api/src/db/migrations/001_initial_schema.sql
+-- CODEX: All financial tables go here. No financial table in D1 ever.
+-- CODEX: transactions table is INSERT-ONLY — generate NO UPDATE or DELETE paths for it.
+
+CREATE TABLE users (
+  id              VARCHAR(26) PRIMARY KEY,           -- ULID
+  username        VARCHAR(50) UNIQUE NOT NULL,
+  password_hash   VARCHAR(255) NOT NULL,             -- Argon2id
+  status          ENUM('active','suspended','banned') NOT NULL DEFAULT 'active',
+  betting_enabled BOOLEAN NOT NULL DEFAULT true,
+  role            ENUM('user') NOT NULL DEFAULT 'user',
+  agent_id        VARCHAR(26) REFERENCES users(id),
+  max_bet         DECIMAL(12,2) NOT NULL,
+  max_bet_per_day DECIMAL(12,2) NOT NULL,
+  max_win_per_day DECIMAL(12,2) NOT NULL,
+  allowed_sports  JSON NOT NULL,
+  created_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by      VARCHAR(26) NOT NULL,
+  INDEX idx_username (username),
+  INDEX idx_status (status),
+  INDEX idx_agent_id (agent_id)
+);
+
+CREATE TABLE admin_users (
+  id              VARCHAR(26) PRIMARY KEY,
+  username        VARCHAR(50) UNIQUE NOT NULL,
+  password_hash   VARCHAR(255) NOT NULL,
+  role            ENUM('superadmin','senior_admin','agent','readonly_admin') NOT NULL,
+  status          ENUM('active','suspended') NOT NULL DEFAULT 'active',
+  agent_ceiling_max_bet DECIMAL(12,2),
+  created_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by      VARCHAR(26),
+  INDEX idx_role (role)
+);
+
+CREATE TABLE wallets (
+  id                  VARCHAR(26) PRIMARY KEY,
+  user_id             VARCHAR(26) UNIQUE NOT NULL REFERENCES users(id),
+  balance             DECIMAL(14,2) NOT NULL DEFAULT 0.00,
+  bonus               DECIMAL(14,2) NOT NULL DEFAULT 0.00,
+  pending_withdrawal  DECIMAL(14,2) NOT NULL DEFAULT 0.00,
+  frozen              BOOLEAN NOT NULL DEFAULT false,
+  currency            CHAR(3) NOT NULL DEFAULT 'INR',
+  updated_at          TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  INDEX idx_user_id (user_id)
+);
+
+-- CODEX: INSERT ONLY. Never generate UPDATE or DELETE statements for this table.
+CREATE TABLE transactions (
+  id             VARCHAR(26) PRIMARY KEY,
+  wallet_id      VARCHAR(26) NOT NULL REFERENCES wallets(id),
+  user_id        VARCHAR(26) NOT NULL,
+  type           ENUM('deposit','withdrawal','bet_stake','bet_win','bet_refund',
+                      'cashout','bonus','admin_credit','admin_debit') NOT NULL,
+  amount         DECIMAL(14,2) NOT NULL,
+  balance_before DECIMAL(14,2) NOT NULL,
+  balance_after  DECIMAL(14,2) NOT NULL,
+  reference_id   VARCHAR(26),
+  note           VARCHAR(255),
+  created_by     VARCHAR(26),
+  fx_rate        DECIMAL(10,6),
+  created_at     TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_wallet_id (wallet_id),
+  INDEX idx_user_id (user_id),
+  INDEX idx_type (type),
+  INDEX idx_created_at (created_at)
+);
+
+CREATE TABLE bets (
+  id                VARCHAR(26) PRIMARY KEY,
+  user_id           VARCHAR(26) NOT NULL REFERENCES users(id),
+  type              ENUM('single','accumulator') NOT NULL,
+  status            ENUM('open','settled','void','pending_settlement') NOT NULL DEFAULT 'open',
+  outcome           ENUM('win','loss','cashout','push','void') NULL,
+  total_stake       DECIMAL(12,2) NOT NULL,
+  potential_payout  DECIMAL(14,2) NOT NULL,
+  settled_amount    DECIMAL(14,2) NULL,
+  odds_at_placement DECIMAL(8,4) NOT NULL,
+  risk_score        DECIMAL(4,3) NOT NULL DEFAULT 0.000,
+  review_flag       BOOLEAN NOT NULL DEFAULT false,
+  idempotency_key   VARCHAR(64) UNIQUE NOT NULL,
+  placed_at         TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  accepted_at       TIMESTAMP NULL,
+  settled_at        TIMESTAMP NULL,
+  INDEX idx_user_id (user_id),
+  INDEX idx_status (status),
+  INDEX idx_placed_at (placed_at),
+  INDEX idx_review_flag (review_flag)
+);
+
+CREATE TABLE bet_selections (
+  id             VARCHAR(26) PRIMARY KEY,
+  bet_id         VARCHAR(26) NOT NULL REFERENCES bets(id),
+  match_id       VARCHAR(26) NOT NULL,
+  market_id      VARCHAR(26) NOT NULL,
+  selection_id   VARCHAR(26) NOT NULL,
+  selection_name VARCHAR(100) NOT NULL,
+  odds           DECIMAL(8,4) NOT NULL,
+  outcome        ENUM('win','loss','void','push') NULL,
+  INDEX idx_bet_id (bet_id),
+  INDEX idx_match_id (match_id),
+  INDEX idx_market_id (market_id)
+);
+
+CREATE TABLE deposit_requests (
+  id               VARCHAR(26) PRIMARY KEY,
+  user_id          VARCHAR(26) NOT NULL REFERENCES users(id),
+  amount           DECIMAL(12,2) NOT NULL,
+  status           ENUM('pending','approved','rejected') NOT NULL DEFAULT 'pending',
+  reference_note   VARCHAR(255),
+  reviewed_by      VARCHAR(26),
+  rejection_reason VARCHAR(255),
+  created_at       TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  reviewed_at      TIMESTAMP NULL,
+  INDEX idx_user_id (user_id),
+  INDEX idx_status (status)
+);
+
+CREATE TABLE withdrawal_requests (
+  id               VARCHAR(26) PRIMARY KEY,
+  user_id          VARCHAR(26) NOT NULL REFERENCES users(id),
+  amount           DECIMAL(12,2) NOT NULL,
+  bank_details     JSON NOT NULL,
+  status           ENUM('pending','approved','rejected') NOT NULL DEFAULT 'pending',
+  reviewed_by      VARCHAR(26),
+  rejection_reason VARCHAR(255),
+  created_at       TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  reviewed_at      TIMESTAMP NULL,
+  INDEX idx_user_id (user_id),
+  INDEX idx_status (status)
+);
+```
+
+### 7.3 D1 Schema `[P0/P1]`
+
+```sql
+-- FILE: workers/api/src/db/migrations/d1/001_reference_and_audit.sql
+-- CODEX: matches/markets/selections are reference data — admin writes only, frequent reads.
+-- CODEX: audit_log, odds_history, fraud_flags are append-only — generate NO UPDATE/DELETE paths.
+
+CREATE TABLE sports (id TEXT PRIMARY KEY, name TEXT NOT NULL, slug TEXT UNIQUE NOT NULL);
+
+CREATE TABLE leagues (
+  id TEXT PRIMARY KEY, sport_id TEXT NOT NULL REFERENCES sports(id),
+  name TEXT NOT NULL, country TEXT
+);
+
+CREATE TABLE matches (
+  id           TEXT PRIMARY KEY,
+  sport_id     TEXT NOT NULL REFERENCES sports(id),
+  league_id    TEXT NOT NULL REFERENCES leagues(id),
+  home_team    TEXT NOT NULL,
+  away_team    TEXT NOT NULL,
+  venue        TEXT,
+  start_time   TEXT NOT NULL,
+  status       TEXT NOT NULL DEFAULT 'upcoming',
+  betting_open INTEGER NOT NULL DEFAULT 1,
+  feed_source  TEXT NOT NULL DEFAULT 'manual',
+  external_id  TEXT,
+  home_score   INTEGER,
+  away_score   INTEGER,
+  result_data  TEXT,
+  created_by   TEXT NOT NULL,
+  created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE markets (
+  id                  TEXT PRIMARY KEY,
+  match_id            TEXT NOT NULL REFERENCES matches(id),
+  name                TEXT NOT NULL,
+  type                TEXT NOT NULL,
+  status              TEXT NOT NULL DEFAULT 'open',
+  margin              REAL NOT NULL DEFAULT 0.05,
+  max_liability       DECIMAL(14,2) NOT NULL,
+  result_selection_id TEXT,
+  settled_at          TEXT,
+  INDEX idx_match_id (match_id), INDEX idx_status (status)
+);
+
+CREATE TABLE selections (
+  id TEXT PRIMARY KEY, market_id TEXT NOT NULL REFERENCES markets(id),
+  name TEXT NOT NULL, odds REAL NOT NULL, status TEXT NOT NULL DEFAULT 'active'
+);
+
+-- APPEND-ONLY
+CREATE TABLE odds_history (
+  id TEXT PRIMARY KEY, selection_id TEXT NOT NULL, market_id TEXT NOT NULL,
+  match_id TEXT NOT NULL, old_odds REAL NOT NULL, new_odds REAL NOT NULL,
+  changed_by TEXT NOT NULL, source TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- APPEND-ONLY — also mirrored to R2 as NDJSON
+CREATE TABLE audit_log (
+  id TEXT PRIMARY KEY, admin_id TEXT NOT NULL, admin_role TEXT NOT NULL,
+  action TEXT NOT NULL, entity_type TEXT NOT NULL, entity_id TEXT NOT NULL,
+  before_state TEXT, after_state TEXT,
+  ip_address TEXT NOT NULL, user_agent TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  INDEX idx_admin_id (admin_id), INDEX idx_action (action),
+  INDEX idx_entity_type_id (entity_type, entity_id), INDEX idx_created_at (created_at)
+);
+
+-- APPEND-ONLY
+CREATE TABLE fraud_flags (
+  id TEXT PRIMARY KEY, bet_id TEXT NOT NULL, user_id TEXT NOT NULL,
+  flag_type TEXT NOT NULL, severity TEXT NOT NULL, details TEXT NOT NULL,
+  dismissed INTEGER NOT NULL DEFAULT 0, dismissed_by TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE login_history (
+  id TEXT PRIMARY KEY, user_id TEXT NOT NULL, user_type TEXT NOT NULL DEFAULT 'user',
+  ip_address TEXT NOT NULL, ip_country TEXT, user_agent TEXT,
+  device_fingerprint TEXT, success INTEGER NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE notifications (
+  id TEXT PRIMARY KEY, user_id TEXT NOT NULL, type TEXT NOT NULL,
+  title TEXT NOT NULL, body TEXT NOT NULL, read INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  INDEX idx_user_id_read (user_id, read)
+);
+```
+
+---
+
+## 8 — KV NAMESPACE DESIGN
+
+| Namespace | Key Pattern | Value | TTL | Notes |
+|---|---|---|---|---|
+| `SESSIONS` | `sess:{token}` | `{ userId, username, balance, deviceFP }` | 86400s sliding | `cacheTtl:0` always |
+| `ADMIN_SESSIONS` | `asess:{token}` | `{ adminId, role, ipHash }` | 28800s non-sliding | IP mismatch → delete + 401 |
+| `SESSIONS` | `user_sessions:{userId}` | `["sess:tok1","sess:tok2"]` | 90000s | Bulk revocation index |
+| `ODDS_CACHE` | `odds:{matchId}:{marketId}` | `{ selections:[{id,odds}], updatedAt }` | DO-managed | Eventual consistency OK |
+| `SUSPENDED_MARKETS` | `susp:{matchId}` | `"1"` | Set by DO alarm | `cacheTtl:0` — NEVER cache |
+| `MARKET_LIABILITY` | `lia:{matchId}:{marketId}:{selectionId}` | `{ totalStaked, totalPotentialPayout }` | No TTL | Updated per bet |
+| `RATE_LIMITS` | `rl:login:{ip}` | count string | 900s | DO counter for login (not raw KV) |
+| `RATE_LIMITS` | `rl:api:{ip}` | count string | 60s | KV acceptable |
+| `RATE_LIMITS` | `rl:bet:{userId}` | count string | 60s | 20 bets/min ceiling |
+| `FEED_DEDUP` | `dedup:{fingerprint}` | `"1"` | 300s | SHA-256 of matchId+eventType+ts+data |
+
+> **CODEX — KV consistency rules:**
+> - `SUSPENDED_MARKETS` reads: always `{ cacheTtl: 0 }` — a cached miss allows a bet on a suspended market (P0 bug)
+> - `SESSIONS` reads: always `{ cacheTtl: 0 }` — stale session = auth bypass
+> - `ODDS_CACHE` reads: default cache OK — 1–2s stale is acceptable; DB is settlement authority
+
+---
+
+## 9 — AUTHENTICATION AND SESSION IMPLEMENTATION
+
+### 9.1 User Login Flow
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant API as API Worker
+    participant PS as PlanetScale
+    participant KV as KV SESSIONS
+    participant D1
+
+    Client->>API: POST /api/auth/login { username, password }
+    API->>API: Zod validate
+    API->>KV: GET rl:login:{ip} (rate limit)
+    API->>PS: SELECT * FROM users WHERE username = ?
+    API->>API: Argon2id.verify(~300ms)
+    API->>API: Generate opaque token = hex(crypto.getRandomValues(32))
+    API->>KV: SET sess:{token} TTL=86400
+    API->>KV: RPUSH user_sessions:{userId}
+    API->>D1: INSERT login_history
+    API-->>Client: 200 + Set-Cookie: sess_token={token}; HttpOnly; Secure; SameSite=Strict
+```
+
+### 9.2 authGuard Middleware `[P0]`
+
+```typescript
+// FILE: workers/api/src/middleware/authGuard.ts
+// CODEX: Export as named async function (c: Context, next: Next).
+// CODEX: Use getCookie from hono/cookie. cacheTtl:0 is MANDATORY — never omit.
+// CODEX: Slide TTL on EVERY authenticated request (PUT with same TTL).
+// CODEX: Attach session to context via c.set("user", session).
+export async function authGuard(c: Context, next: Next) {
+  const token = getCookie(c, "sess_token")
+  if (!token) return c.json({ error: "UNAUTHORIZED" }, 401)
+
+  const session = await c.env.SESSIONS.get(`sess:${token}`, {
+    type: "json",
+    cacheTtl: 0,   // CRITICAL — never remove this option
+  })
+  if (!session) return c.json({ error: "SESSION_EXPIRED" }, 401)
+
+  // Slide TTL
+  await c.env.SESSIONS.put(`sess:${token}`, JSON.stringify(session), {
+    expirationTtl: 86400,
+  })
+
+  c.set("user", session)
+  await next()
+}
+```
+
+### 9.3 Admin Session Differences
+
+| Property | User Sessions | Admin Sessions |
+|---|---|---|
+| KV Namespace | `SESSIONS` | `ADMIN_SESSIONS` |
+| Prefix | `sess:` | `asess:` |
+| TTL | 86400s sliding | 28800s **non-sliding** |
+| IP binding | None | `ipHash` stored; mismatch → delete session + 401 |
+| Role | Implicit (always 'user') | Stored: `superadmin\|senior_admin\|agent\|readonly_admin` |
+
+### 9.4 adminGuard Middleware `[P0]`
+
+```typescript
+// FILE: workers/api/src/middleware/adminGuard.ts
+// CODEX: Returns a factory: adminGuard(allowedRoles[]).
+// CODEX: IP hash check must execute on EVERY /sgyt/* request, not just login.
+// CODEX: Session delete + 401 on IP mismatch — do not just return 403.
+export function adminGuard(allowedRoles: AdminRole[]) {
+  return async (c: Context, next: Next) => {
+    const token = getCookie(c, "sess_token")
+    const session = await c.env.ADMIN_SESSIONS.get(`asess:${token}`, {
+      type: "json", cacheTtl: 0,
+    })
+    if (!session) return c.json({ error: "UNAUTHORIZED" }, 401)
+    if (!allowedRoles.includes(session.role)) return c.json({ error: "FORBIDDEN" }, 403)
+
+    const currentIpHash = await sha256(c.req.header("CF-Connecting-IP") ?? "")
+    if (session.ipHash && session.ipHash !== currentIpHash) {
+      await c.env.ADMIN_SESSIONS.delete(`asess:${token}`)
+      return c.json({ error: "SESSION_IP_MISMATCH" }, 401)
+    }
+
+    c.set("admin", session)
+    await next()
+  }
+}
+```
+
+### 9.5 Account Suspension — Instant Revocation `[P0]`
+
+```typescript
+// FILE: workers/api/src/services/userService.ts → suspendUser()
+// CODEX: Step order is critical. DB update first, then KV purge. All three steps required.
+// CODEX: Promise.all for parallel KV deletes — do not await sequentially.
+async function suspendUser(userId: string, adminId: string, env: Env) {
+  await ps.execute("UPDATE users SET status='suspended' WHERE id=?", [userId])
+
+  const sessionIndex = await env.SESSIONS.get(
+    `user_sessions:${userId}`, { type: "json" }
+  )
+  if (sessionIndex?.length) {
+    await Promise.all(sessionIndex.map((key: string) => env.SESSIONS.delete(key)))
+    await env.SESSIONS.delete(`user_sessions:${userId}`)
+  }
+
+  await auditService.logAction({ action: "user.suspend", adminId, entityId: userId })
+}
+```
+
+---
+
+## 10 — WEBSOCKET AND REALTIME IMPLEMENTATION
+
+### 10.1 WebSocket Worker `[P0]`
+
+```typescript
+// FILE: workers/websocket/src/worker.ts
+// CODEX: Validate sess_token from KV (cacheTtl:0) BEFORE WebSocket upgrade.
+// CODEX: /match/:matchId routes to MatchDO; /admin routes to AdminBroadcastDO.
+// CODEX: Pass X-User-Id header to DO so it can tag the connection.
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const token = getCookieFromRequest(request, "sess_token")
+    const session = await env.SESSIONS.get(
+      `sess:${token}`, { type: "json", cacheTtl: 0 }
+    )
+    if (!session) return new Response("Unauthorized", { status: 401 })
+
+    const url = new URL(request.url)
+    const matchRoute = url.pathname.match(/^\/match\/([a-z0-9]+)$/)
+    if (matchRoute) {
+      const doId = env.MATCH_DO.idFromName(`match:${matchRoute[1]}`)
+      const stub = env.MATCH_DO.get(doId)
+      return stub.fetch(new Request(request, {
+        headers: { ...Object.fromEntries(request.headers), "X-User-Id": session.userId }
+      }))
+    }
+
+    if (url.pathname === "/admin") {
+      const adminSession = await env.ADMIN_SESSIONS.get(
+        `asess:${token}`, { type: "json", cacheTtl: 0 }
+      )
+      if (!adminSession) return new Response("Forbidden", { status: 403 })
+      return env.ADMIN_BROADCAST_DO.get(
+        env.ADMIN_BROADCAST_DO.idFromName("admin:broadcast")
+      ).fetch(request)
+    }
+
+    return new Response("Not Found", { status: 404 })
+  }
+}
+```
+
+### 10.2 MatchDurableObject `[P0]`
+
+```typescript
+// FILE: workers/durable-objects/src/MatchDurableObject.ts
+// CODEX: Use Hibernation API — ctx.acceptWebSocket(server), ctx.getWebSockets().
+// CODEX: blockConcurrencyWhile() in constructor to restore matchState on cold start.
+// CODEX: Internal updates authenticated via X-Internal-Secret header check.
+// CODEX: triggerAutoSuspension() writes KV and sets DO alarm — both required.
+export class MatchDurableObject {
+  constructor(private state: DurableObjectState, private env: Env) {
+    state.blockConcurrencyWhile(async () => {
+      const stored = await state.storage.get<MatchState>("matchState")
+      if (stored) this.matchState = stored
+    })
+  }
+
+  async alarm() {
+    // Auto-reopen: delete KV suspension flag, broadcast market_reopen
+    const matchId = await this.state.storage.get<string>("matchId")
+    await this.env.SUSPENDED_MARKETS.delete(`susp:${matchId}`)
+    this.broadcast({ type: "market_reopen", matchId })
+  }
+
+  private broadcast(payload: object) {
+    const msg = JSON.stringify(payload)
+    for (const ws of this.state.getWebSockets()) {
+      try { ws.send(msg) } catch { /* hibernation handles dead connections */ }
+    }
+  }
+}
+```
+
+### 10.3 WebSocket Message Types
+
+| Direction | Type | Payload |
+|---|---|---|
+| Server→Client | `init` | `{ matchState: { score, markets, updatedAt } }` |
+| Server→Client | `odds_update` | `{ marketId, selections: [{id, odds}], updatedAt }` |
+| Server→Client | `score_update` | `{ sport, data: SportScoreObject }` |
+| Server→Client | `market_suspension` | `{ matchId, marketId?, reason }` |
+| Server→Client | `market_reopen` | `{ matchId, marketId? }` |
+| Server→Client | `bet_settled` | `{ betId, outcome, settledAmount }` |
+| Server→Client | `deposit_approved` | `{ amount, newBalance }` |
+| Admin→Client | `bet_placed` | `{ betId, userId, market, stake, odds, riskScore }` |
+| Admin→Client | `risk_alert` | `{ userId, alertType, data }` |
+| Admin→Client | `fraud_flag` | `{ betId, userId, flagType, severity }` |
+
+---
+
+## 11 — FEED INGESTION IMPLEMENTATION
+
+### 11.1 Internal Event Schema
+
+```typescript
+// FILE: packages/types/events.ts
+// CODEX: ALL external feeds must be normalised to this schema before any processing.
+// CODEX: fingerprint = SHA-256(matchId + eventType + timestamp + JSON.stringify(data))
+interface InternalEvent {
+  matchId:     string
+  sport:       "cricket" | "football" | "tennis" | "volleyball"
+  eventType:   string       // "wicket"|"goal"|"score_update"|"odds_update"|"set_complete"
+  data:        Record<string, unknown>
+  timestamp:   number       // Unix ms from external feed
+  source:      "entitysport" | "sportmonks" | "apisports" | "manual"
+  fingerprint: string
+}
+```
+
+### 11.2 Feed Sources
+
+| Sport | Provider | Method | Interval |
+|---|---|---|---|
+| Cricket | EntitySport | Webhook push | N/A — push |
+| Football | SportMonks | Webhook push | N/A — push |
+| Tennis | API-Sports | Poll | 10s during live |
+| Volleyball | API-Sports | Poll | 10s during live |
+
+### 11.3 Deduplicator `[P0]`
+
+```typescript
+// FILE: workers/feed/src/deduplicator.ts
+// CODEX: fingerprint = SHA-256(matchId+eventType+timestamp+JSON.stringify(data))
+// CODEX: KV namespace is FEED_DEDUP. TTL 300s. Return bool only.
+export async function isDuplicate(fingerprint: string, env: Env): Promise<boolean> {
+  const existing = await env.FEED_DEDUP.get(`dedup:${fingerprint}`)
+  if (existing) return true
+  await env.FEED_DEDUP.put(`dedup:${fingerprint}`, "1", { expirationTtl: 300 })
+  return false
+}
+```
+
+---
+
+## 12 — BETTING ENGINE IMPLEMENTATION
+
+### 12.1 Bet Placement Pipeline `[P0 — strict order, no deviation]`
+
+```mermaid
+flowchart TD
+    A[POST /api/bets] --> B[authGuard: validate sess_token cacheTtl:0]
+    B --> C[Zod validate body]
+    C --> D{KV SUSPENDED_MARKETS\nsusp:matchId — cacheTtl:0}
+    D -- Suspended --> E[423 MARKET_SUSPENDED]
+    D -- Clear --> F[BettingSlipDO.acquireLock idempotencyKey]
+    F -- Duplicate key --> G[Return original bet — idempotent]
+    F -- New key --> H[enforceUserLimits — betting_enabled, max_bet, per_day, allowed_sports]
+    H -- Fail --> I[400 with specific code]
+    H -- Pass --> J[Read odds from KV ODDS_CACHE]
+    J --> K[calculateRiskScore — <20ms, no PS reads]
+    K -- score > 0.9 --> L[status=pending_manual — hold for admin]
+    K -- score <= 0.9 --> M{Live bet delay?}
+    M -- Yes --> N[Hold lock 3s — re-check suspension + odds]
+    N -- Odds changed >5% --> O[400 ODDS_CHANGED — prompt re-confirm]
+    N -- Valid --> Q
+    M -- No --> Q[BEGIN PlanetScale transaction]
+    Q --> R[SELECT wallets FOR UPDATE]
+    R --> S{balance >= stake\nAND not frozen}
+    S -- No --> T[400 + ROLLBACK]
+    S -- Yes --> U[UPDATE wallet balance -= stake]
+    U --> V[INSERT transaction type=bet_stake]
+    V --> W[INSERT bet + bet_selections]
+    W --> X[UPDATE KV MARKET_LIABILITY]
+    X --> Y[COMMIT]
+    Y --> Z[BettingSlipDO.releaseLock]
+    Z --> AA[fraud-analysis-queue.send async]
+    AA --> AB[201 betId + status:accepted]
+```
+
+### 12.2 walletService — Atomic Pattern `[P0]`
+
+```typescript
+// FILE: workers/api/src/services/walletService.ts
+// CODEX: This is the ONLY file that writes to wallets and transactions tables.
+// CODEX: credit() and debit() must always be called inside an existing PS transaction.
+// CODEX: balance_before and balance_after are REQUIRED on every transactions INSERT.
+// CODEX: Use Decimal.js for all arithmetic — never native JS floats.
+export async function credit(
+  tx: PlanetScaleTransaction,
+  userId: string,
+  amount: Decimal,
+  type: TransactionType,
+  referenceId?: string,
+  note?: string
+) {
+  const [wallet] = await tx.execute(
+    "SELECT id, balance, frozen FROM wallets WHERE user_id = ? FOR UPDATE",
+    [userId]
+  )
+  if (wallet.frozen) throw new WalletFrozenError()
+  if (amount.lte(0)) throw new InvalidAmountError()
+
+  const balanceBefore = new Decimal(wallet.balance)
+  const balanceAfter = balanceBefore.plus(amount)
+
+  await tx.execute(
+    "UPDATE wallets SET balance = ?, updated_at = NOW() WHERE id = ?",
+    [balanceAfter.toString(), wallet.id]
+  )
+  await tx.execute(
+    `INSERT INTO transactions
+       (id, wallet_id, user_id, type, amount, balance_before, balance_after,
+        reference_id, note, created_at)
+     VALUES (?,?,?,?,?,?,?,?,?,NOW())`,
+    [ulid(), wallet.id, userId, type, amount.toString(),
+     balanceBefore.toString(), balanceAfter.toString(), referenceId, note]
+  )
+}
+```
+
+### 12.3 Accumulator Handling
+
+```typescript
+// FILE: workers/api/src/services/betService.ts
+// CODEX: combinedOdds = product of all selection odds. Stored in bets.odds_at_placement.
+// CODEX: Each leg = separate bet_selections row. Void any leg → void whole accumulator.
+const combinedOdds = selections.reduce((acc, sel) => acc * sel.odds, 1.0)
+const potentialPayout = stake * combinedOdds
+```
+
+### 12.4 Cashout Service `[P1]`
+
+```typescript
+// FILE: workers/api/src/services/cashoutService.ts
+// CODEX: Formula: (currentOdds / oddsAtPlacement) * totalStake * (1 - cashoutMargin)
+// CODEX: cashoutMargin comes from admin settings KV key — not hardcoded.
+// CODEX: Entire operation inside one PS transaction: wallet credit + bet status update.
+// CODEX: releaseMarketLiability() must be called inside the same transaction.
+async function executeCashout(betId: string, userId: string, env: Env) {
+  const bet = await getBet(betId)
+  if (bet.status !== "open") throw new Error("BET_NOT_OPEN")
+
+  const currentOdds = await getCurrentOddsForBet(bet, env)
+  const cashoutMargin = await getAdminSetting("cashout_margin", env)
+  const cashoutValue = (currentOdds / bet.oddsAtPlacement)
+    * bet.totalStake * (1 - cashoutMargin)
+
+  if (cashoutValue <= 0) throw new Error("CASHOUT_BLOCKED_NEGATIVE_VALUE")
+
+  await ps.transaction(async (tx) => {
+    await walletService.credit(tx, userId, cashoutValue, "cashout", betId)
+    await tx.execute(
+      "UPDATE bets SET status='settled', outcome='cashout', settled_amount=?, settled_at=NOW() WHERE id=?",
+      [cashoutValue, betId]
+    )
+    await releaseLiability(bet, env)
+  })
+}
+```
+
+### 12.5 Settlement Pipeline `[P0]`
+
+Settlement is triggered by admin submitting match result (`POST /api/sgyt/matches/:matchId/result`):
+
+1. API Worker: updates `match.status='completed'`, suspends all markets in D1 + KV, paginates open bets (100/page), publishes bet IDs in batches of 10 to `settlement-queue`
+2. Settlement Worker: evaluates each bet against result; winning bets → `walletService.credit()` (type=`bet_win`); losing → status update only; void → `walletService.credit()` (type=`bet_refund`)
+3. Re-settlement: Super Admin triggers → all prior settlements voided (stake refunded) → re-settled with corrected result → full audit trail written
+
+```typescript
+// FILE: workers/settlement/src/settlementProcessor.ts
+// CODEX: Check bet.status !== 'open' first — makes processing idempotent.
+// CODEX: releaseMarketLiability() must be INSIDE the PS transaction, not after.
+// CODEX: notifyUserSettlement() is fire-and-forget — do not await it before ack().
+async function processSettlement(betId: string, matchResult: MatchResult, env: Env) {
+  const bet = await getBetWithSelections(betId)
+  if (bet.status !== "open") return  // idempotent
+
+  const outcome = evaluateOutcome(bet.selections, matchResult)
+
+  await ps.transaction(async (tx) => {
+    if (outcome === "win") {
+      await walletService.credit(tx, bet.userId, bet.potentialPayout, "bet_win", betId)
+      await tx.execute(
+        "UPDATE bets SET status='settled', outcome='win', settled_amount=?, settled_at=NOW() WHERE id=?",
+        [bet.potentialPayout, betId]
+      )
+    } else if (outcome === "loss") {
+      await tx.execute(
+        "UPDATE bets SET status='settled', outcome='loss', settled_amount=0, settled_at=NOW() WHERE id=?",
+        [betId]
+      )
+    }
+    await releaseMarketLiability(bet, env)
+  })
+
+  notifyUserSettlement(bet, outcome, env)  // fire-and-forget
+}
+```
+
+---
+
+## 13 — WALLET AND TRANSACTION HANDLING
+
+### 13.1 Available Balance Formula
+
+```
+available_balance = wallet.balance - wallet.pending_withdrawal - SUM(open_bets.total_stake)
+```
+
+`pending_withdrawal` is set atomically when withdrawal request is created; cleared on approval or rejection.
+
+### 13.2 Withdrawal Workflow
+
+```mermaid
+stateDiagram-v2
+    [*] --> pending : User submits request\npending_withdrawal += amount
+    pending --> approved : Admin approves\natomic wallet debit + pending_withdrawal reset
+    pending --> rejected : Admin rejects\npending_withdrawal reset + notification
+    approved --> [*]
+    rejected --> [*]
+```
+
+---
+
+## 14 — ADMIN SYSTEM IMPLEMENTATION
+
+### 14.1 Role Permission Matrix `[P0]`
+
+| Action | Route | Allowed Roles |
+|---|---|---|
+| Create user | `POST /api/sgyt/users` | superadmin, senior_admin, agent |
+| Edit any user | `PUT /api/sgyt/users/:id` | superadmin, senior_admin |
+| Edit own users | `PUT /api/sgyt/users/:id` | agent (agent_id must match) |
+| Void bet | `POST /api/sgyt/bets/:id/void` | superadmin, senior_admin |
+| Update odds | `PUT /api/sgyt/odds/:selectionId` | superadmin, senior_admin |
+| Kill switch | `POST /api/sgyt/markets/suspend-all` | superadmin, senior_admin |
+| Delete records | `DELETE /api/sgyt/*` | superadmin only |
+| Manage admins | `POST/PUT /api/sgyt/admins` | superadmin only |
+| View reports | `GET /api/sgyt/reports/*` | superadmin, senior_admin, readonly_admin |
+
+### 14.2 auditService `[P0]`
+
+```typescript
+// FILE: workers/api/src/services/auditService.ts
+// CODEX: D1 write is SYNCHRONOUS (awaited before response). R2 write is async via queue.
+// CODEX: before_state and after_state are JSON snapshots — always both required.
+// CODEX: This must be called in every admin route before returning the response.
+export async function logAction(params: AuditEntry, env: Env) {
+  const entry: AuditLogRow = {
+    id: ulid(),
+    admin_id: params.adminId,
+    admin_role: params.adminRole,
+    action: params.action,           // e.g. 'user.suspend', 'odds.update', 'bet.void'
+    entity_type: params.entityType,
+    entity_id: params.entityId,
+    before_state: JSON.stringify(params.before ?? null),
+    after_state: JSON.stringify(params.after ?? null),
+    ip_address: params.ipAddress,
+    user_agent: params.userAgent,
+    created_at: new Date().toISOString(),
+  }
+
+  // Synchronous D1 write
+  await env.DB_D1.prepare(
+    `INSERT INTO audit_log VALUES (?,?,?,?,?,?,?,?,?,?,?)`
+  ).bind(...Object.values(entry)).run()
+
+  // Async R2 write via queue (non-blocking)
+  env.AUDIT_QUEUE.send(entry)        // intentionally not awaited
+}
+```
+
+### 14.3 Kill Switch `[P0]`
+
+```typescript
+// FILE: workers/api/src/routers/adminOddsRouter.ts → POST /api/sgyt/markets/suspend-all
+// CODEX: Bulk KV writes must complete (Promise.all) before response.
+// CODEX: AdminBroadcastDO notify is best-effort — do not fail if DO unreachable.
+// CODEX: auditService.logAction() required before return.
+async function globalKillSwitch(env: Env, adminId: string) {
+  const liveMatches = await env.DB_D1.prepare(
+    "SELECT id FROM matches WHERE status='live' AND betting_open=1"
+  ).all()
+
+  await Promise.all(
+    liveMatches.results.map((m: any) =>
+      env.SUSPENDED_MARKETS.put(`susp:${m.id}`, "1")
+    )
+  )
+
+  try {
+    const adminDO = env.ADMIN_BROADCAST_DO.get(
+      env.ADMIN_BROADCAST_DO.idFromName("admin:broadcast")
+    )
+    await adminDO.fetch(new Request("https://internal/broadcast", {
+      method: "POST",
+      headers: { "X-Internal-Secret": env.INTERNAL_SECRET },
+      body: JSON.stringify({
+        type: "global_kill_switch",
+        matchIds: liveMatches.results.map((m: any) => m.id)
+      })
+    }))
+  } catch { /* best-effort */ }
+
+  await auditService.logAction({
+    action: "market.kill_switch_activated", adminId, entityType: "platform", entityId: "*"
+  }, env)
+}
+```
+
+---
+
+## 15 — RISK AND FRAUD ENGINE IMPLEMENTATION
+
+### 15.1 Risk Scoring `[P1]`
+
+```typescript
+// FILE: workers/api/src/services/riskService.ts
+// CODEX: Must complete in <20ms. Zero PlanetScale reads inside this function.
+// CODEX: All inputs pre-fetched from KV or passed in the bet request.
+// CODEX: risk_score clamped 0.0–1.0. Threshold: 0.7=flag, 0.9=hold.
+interface RiskFactors {
+  stakeVsUserAverage:  number   // this stake / user 30-day avg
+  stakeVsMarketLimit:  number   // this stake / market.max_liability
+  oddsValue:           number   // (odds - 1.0) / 100 normalised
+  userRecentPnL:       number   // recent net P&L / max_win_per_day
+  userWinRate:         number   // win_count / settled_count
+  timeToEvent:         number   // 0=pre-match, 1=live last 5min
+  marketLiquidity:     number   // 1.0 / total bets on market
+}
+
+const WEIGHTS = {
+  stakeVsUserAverage: 0.25, stakeVsMarketLimit: 0.20,
+  oddsValue: 0.10, userRecentPnL: 0.20, userWinRate: 0.15,
+  timeToEvent: 0.05, marketLiquidity: 0.05,
+}
+
+export function calculateRiskScore(factors: RiskFactors): number {
+  return Object.entries(WEIGHTS).reduce((score, [factor, weight]) =>
+    score + Math.min(factors[factor as keyof RiskFactors], 1.0) * weight
+  , 0)
+}
+```
+
+Thresholds: `0.0–0.69` accept, `0.7–0.89` accept + `review_flag=true`, `0.9–1.0` `status=pending_manual`.
+
+### 15.2 Fraud Rules `[P1]`
+
+| Rule | Logic |
+|---|---|
+| Matched betting | Same user, opposing selections on same market within 60s |
+| Syndicate | >2 users sharing device_fingerprint or IP betting same market within 60s |
+| Sharp bettor | `win_rate > theoretical_hold + 2σ` over 30+ settled bets |
+| Stake spike | Current stake > 5× user's 30-day average stake |
+
+---
+
+## 16 — API SPECIFICATIONS
+
+### 16.1 Response Envelope
+
+```typescript
+// FILE: workers/api/src/middleware/responseFormatter.ts
+// CODEX: All responses use this envelope. Never return raw data without wrapping.
+// Success:
+{ "success": true, "data": { ... }, "requestId": "01HXR..." }
+// Error:
+{ "success": false, "error": { "code": "MARKET_SUSPENDED", "message": "...", "field": null }, "requestId": "01HXR..." }
+```
+
+| Code | Meaning |
+|---|---|
+| 200 | Successful GET / action |
+| 201 | Resource created |
+| 400 | Validation / business rule failure |
+| 401 | Session missing or expired |
+| 403 | Insufficient role |
+| 409 | Conflict (duplicate) |
+| 423 | Market suspended |
+| 429 | Rate limited |
+| 500 | Unhandled exception (Sentry) |
+
+### 16.2 Core Endpoints (summary)
+
+**Auth:** `POST /api/auth/login`, `POST /api/auth/logout`, `GET /api/auth/me`
+**Matches:** `GET /api/matches?sport=&status=`, `GET /api/matches/:id/markets`
+**Bets:** `POST /api/bets`, `GET /api/bets`, `GET /api/bets/:id`, `POST /api/bets/:id/cashout`
+**Wallet:** `GET /api/wallet`, `GET /api/wallet/transactions`, `POST /api/wallet/deposit`, `POST /api/wallet/withdraw`
+**Notifications:** `GET /api/notifications`, `POST /api/notifications/read-all`
+**Admin Users:** `GET/POST /api/sgyt/users`, `GET/PUT /api/sgyt/users/:id`, `POST /api/sgyt/users/:id/suspend`
+**Admin Bets:** `GET /api/sgyt/bets`, `POST /api/sgyt/bets/:id/void`, `POST /api/sgyt/bets/bulk-void`
+**Admin Odds:** `PUT /api/sgyt/selections/:id/odds`, `POST /api/sgyt/markets/:id/suspend`, `POST /api/sgyt/markets/suspend-all`, `POST /api/sgyt/matches/:id/result`
+**Admin Wallet:** `POST /api/sgyt/wallet/credit`, `POST /api/sgyt/wallet/debit`, deposit/withdrawal approve/reject
+**Admin Reports:** `POST /api/sgyt/reports/generate`, `GET /api/sgyt/reports/:id/download`
+**Admin Audit:** `GET /api/sgyt/audit`
+**Webhooks:** `POST /webhooks/sportmonks`, `POST /webhooks/entitysport`
+
+---
+
+## 17 — VALIDATION AND SECURITY IMPLEMENTATION
+
+### 17.1 Key Zod Schemas `[P0]`
+
+```typescript
+// FILE: workers/api/src/schemas/bets.ts
+// CODEX: max 10 accumulator legs. idempotencyKey must be UUID v4. stake min 1 INR.
+const PlaceBetSchema = z.object({
+  selections: z.array(z.object({
+    matchId:     z.string().ulid(),
+    marketId:    z.string().ulid(),
+    selectionId: z.string().ulid(),
+    odds:        z.number().min(1.01).max(1000),
+  })).min(1).max(10),
+  stake:          z.number().min(1).max(1000000),
+  idempotencyKey: z.string().uuid(),
+  betType:        z.enum(["single", "accumulator"]),
+})
+
+// FILE: workers/api/src/schemas/admin.ts
+const CreateUserSchema = z.object({
+  username:       z.string().min(3).max(50).regex(/^[a-zA-Z0-9_]+$/),
+  password:       z.string().min(8).max(128),
+  maxBet:         z.number().positive(),
+  maxBetPerDay:   z.number().positive(),
+  maxWinPerDay:   z.number().positive(),
+  allowedSports:  z.array(z.enum(["cricket","football","tennis","volleyball"])).min(1),
+  initialBalance: z.number().min(0),
+})
+```
+
+### 17.2 Security Headers & CORS
+
+```typescript
+// FILE: workers/api/src/worker.ts
+// CODEX: CORS origin strictly worldgaming.eu.org. credentials:true required for cookies.
+app.use("*", cors({
+  origin: ["https://worldgaming.eu.org"],
+  allowMethods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  allowHeaders: ["Content-Type", "X-Request-ID"],
+  credentials: true,
+  maxAge: 600,
+}))
+```
+
+### 17.3 Argon2id Configuration `[P0]`
+
+```typescript
+// FILE: workers/api/src/lib/password.ts
+// CODEX: Only call from login and reset-password routes (~300ms). NEVER on hot paths.
+import { hash, verify, Algorithm } from "@node-rs/argon2"
+
+export const ARGON2_OPTIONS = {
+  memoryCost: 65536,   // 64MB
+  timeCost: 3,
+  parallelism: 4,
+  outputLen: 32,
+  algorithm: Algorithm.Argon2id,
+}
+```
+
+---
+
+## 18 — RATE LIMITING AND ANTI-ABUSE SYSTEMS
+
+### 18.1 Rate Limit Tiers
+
+| Target | Limit | Window | KV Key | Note |
+|---|---|---|---|---|
+| Login per IP | 5 | 15min | `rl:login:{ip}` | Use DO counter, not raw KV (race condition risk) |
+| General API per IP | 300 | 60s | `rl:api:{ip}` | Raw KV acceptable |
+| Bet placement per user | 20 | 60s | `rl:bet:{userId}` | Raw KV acceptable |
+| Admin login per IP | 3 | 15min | `rl:adminlogin:{ip}` | Alert to AdminBroadcastDO on lock |
+| Webhook per source IP | 1,000 | 60s | `rl:wh:{ip}` | Feed Worker checks this |
+
+```typescript
+// FILE: workers/api/src/middleware/rateLimit.ts
+// CODEX: Login rate limiter MUST use a DO counter — KV get+put is not atomic.
+// CODEX: General API rate limiter can use KV directly (eventual consistency OK).
+// CODEX: Returns false = limit exceeded → return 429 before reaching route handler.
+```
+
+---
+
+## 19 — QUEUE AND EVENT PROCESSING
+
+### 19.1 Queue Definitions
+
+| Queue | Producer | Consumer | Batch | Retries | Backoff |
+|---|---|---|---|---|---|
+| `settlement-queue` | API Worker | Settlement Worker | 10 | 3 | 30s, 60s, 120s |
+| `fraud-analysis-queue` | API Worker | Fraud Worker | 25 | 3 | 10s, 30s, 60s |
+| `audit-log-queue` | API Worker | Audit Worker | 50 | 5 | 5s, 15s, 45s, 90s, 180s |
+
+### 19.2 Settlement Queue Consumer `[P0]`
+
+```typescript
+// FILE: workers/settlement/src/worker.ts
+// CODEX: Export queue handler as { async queue(batch, env) }.
+// CODEX: message.ack() only after successful PS COMMIT.
+// CODEX: message.retry() for RetryableError; message.ack() for non-retryable to prevent DLQ loop.
+// CODEX: Alert if queue depth > 1000 after processing batch.
+export default {
+  async queue(batch: MessageBatch<SettlementMessage>, env: Env): Promise<void> {
+    for (const message of batch.messages) {
+      try {
+        await processSettlement(message.body.betId, message.body.matchResult, env)
+        message.ack()
+      } catch (error) {
+        if (error instanceof RetryableError) {
+          message.retry({ delaySeconds: calculateBackoff(message.attempts) })
+        } else {
+          await logSettlementError(message.body.betId, error, env)
+          message.ack()  // non-retryable — ack to prevent infinite retry
+        }
+      }
+    }
+  }
+}
+```
+
+### 19.3 Audit Log Consumer `[P1]`
+
+```typescript
+// FILE: workers/audit/src/worker.ts
+// CODEX: R2 key pattern: audit-logs/YYYY/MM/DD/HH.ndjson
+// CODEX: batch.ackAll() after successful R2 append.
+// CODEX: D1 is source of truth if R2 fails — do not fail batch on R2 error alone.
+export default {
+  async queue(batch: MessageBatch<AuditEntry>, env: Env): Promise<void> {
+    const dateKey = new Date().toISOString().slice(0, 13).replace("T", "/")
+    const r2Key = `audit-logs/${dateKey}.ndjson`
+    const ndjson = batch.messages.map(m => JSON.stringify(m.body)).join("\n") + "\n"
+    await appendToR2(env.AUDIT_LOGS, r2Key, ndjson)
+    batch.ackAll()
+  }
+}
+```
+
+---
+
+## 20 — STATE MANAGEMENT STRATEGY
+
+### 20.1 Backend State Map
+
+| Data | Storage | Notes |
+|---|---|---|
+| Wallet balance | PlanetScale `wallets` | Source of truth; atomic transactions |
+| Active sessions | KV `SESSIONS` | `cacheTtl:0`; sliding TTL |
+| Current odds | KV `ODDS_CACHE` | Eventual consistency OK |
+| Suspension flags | KV `SUSPENDED_MARKETS` | `cacheTtl:0`; fail closed if KV unavailable |
+| Market liability | KV `MARKET_LIABILITY` | Updated per bet |
+| Live match state | MatchDO persistent storage | Restored on cold start |
+| Bet placement lock | BettingSlipDO storage | Idempotency enforcement |
+| Audit trail | D1 + R2 | D1 for query; R2 for retention |
+
+### 20.2 Frontend State (Zustand)
+
+| State | Store | Behaviour |
+|---|---|---|
+| Auth (userId, username, balance) | `authStore` | Memory; re-fetched from `/api/auth/me` on reload |
+| Bet slip selections | `betSlipStore` | Memory; cleared on placement |
+| Live match state | Component state | Populated by WS `init`; updated by incremental WS messages |
+| Notification count | `notifStore` | Populated on login from `/api/notifications?unread=true` |
+| Admin live KPIs | `adminStore` | Populated by AdminBroadcastDO WS stream |
+
+---
+
+## 21 — ERROR HANDLING STANDARDS
+
+### 21.1 Error Code Registry
+
+| Code | HTTP | Retry? |
+|---|---|---|
+| `UNAUTHORIZED` | 401 | Redirect to login |
+| `SESSION_EXPIRED` | 401 | Redirect to login |
+| `FORBIDDEN` | 403 | Display error |
+| `MARKET_SUSPENDED` | 423 | No retry; show SUSP badge |
+| `INSUFFICIENT_FUNDS` | 400 | Prompt deposit |
+| `LIMIT_MAX_BET` | 400 | Display limit |
+| `LIMIT_DAILY_BET` | 400 | Display limit |
+| `LIMIT_DAILY_WIN` | 400 | Display limit |
+| `SPORT_NOT_ALLOWED` | 400 | Display error |
+| `LIABILITY_EXCEEDED` | 400 | Suggest stake reduction |
+| `WALLET_FROZEN` | 400 | Contact admin |
+| `ODDS_CHANGED` | 400 | Prompt re-confirm |
+| `RATE_LIMITED` | 429 | Retry after header |
+| `INTERNAL_ERROR` | 500 | Retry with backoff; Sentry alert |
+
+### 21.2 Global Error Handler
+
+```typescript
+// FILE: workers/api/src/worker.ts
+// CODEX: This must be registered on the Hono app. Never let unhandled errors leak.
+// CODEX: Always include requestId in error response for Sentry correlation.
+app.onError((err, c) => {
+  Sentry.captureException(err, { extra: { requestId: c.get("requestId") } })
+  return c.json({
+    success: false,
+    error: { code: "INTERNAL_ERROR", message: "An unexpected error occurred." },
+    requestId: c.get("requestId"),
+  }, 500)
+})
+```
+
+---
+
+## 22 — LOGGING AND MONITORING
+
+### 22.1 Structured Log Format
+
+```typescript
+// CODEX: All Workers use console.log() with this exact JSON shape. Never console.error().
+// CODEX: Use Sentry.captureException() for all error-level events.
+{
+  "level": "info",
+  "requestId": "01HXR...",
+  "workerId": "worldgaming-api",
+  "userId": "01HXQ...",
+  "action": "bet.placed",
+  "durationMs": 187,
+  "timestamp": "2026-05-15T14:23:01.123Z"
+}
+```
+
+### 22.2 Alerting Rules
+
+| Alert | Trigger | Channel | Priority |
+|---|---|---|---|
+| Settlement queue backlog | Pending > 1,000 for > 5min | PagerDuty + Telegram | Critical |
+| Worker 5xx spike | Error rate > 1% over 5min | PagerDuty | High |
+| External API down | No response > 60s during live | Telegram | High |
+| Liability spike | User exposure > 80% of market limit | Telegram | Medium |
+| Fraud cluster | 5+ bets from same IP risk_score > 0.8 in 60s | Telegram | Medium |
+| Admin login failures | 3+ failed admin logins in 5min | Telegram | High |
+
+---
+
+## 23 — ENVIRONMENT STRUCTURE
+
+### 23.1 Tiers
+
+| Environment | Domain | DB |
+|---|---|---|
+| Development | `localhost:5174` | D1 local (miniflare) + PlanetScale dev branch |
+| Staging | `staging.worldgaming.eu.org` | PlanetScale staging branch + D1 staging |
+| Production | `worldgaming.eu.org` | PlanetScale main + D1 production |
+
+### 23.2 Secrets — All via `wrangler secret put`
+
+`PLANETSCALE_DATABASE_URL`, `INTERNAL_SECRET`, `ENTITYSPORT_API_KEY`, `ENTITYSPORT_WEBHOOK_SECRET`, `SPORTMONKS_API_KEY`, `SPORTMONKS_WEBHOOK_SECRET`, `APISPORTS_API_KEY`, `SENTRY_DSN`, `TELEGRAM_ALERT_BOT_TOKEN`, `TELEGRAM_ALERT_CHAT_ID`
+
+---
+
+## 24 — DEVOPS AND CI/CD
+
+### 24.1 Monorepo (pnpm workspaces)
+
+```
+worldgaming/ (root)
+  apps/web/, apps/admin/
+  workers/api/, workers/websocket/, workers/feed/
+  workers/settlement/, workers/fraud/, workers/audit/
+  workers/durable-objects/
+  packages/types/
+  infra/
+```
+
+### 24.2 GitHub Actions
+
+- **`test.yml`** (every PR): `tsc --noEmit` → ESLint → Vitest unit → Vitest + Miniflare integration
+- **`deploy-staging.yml`** (push to `main`): build → D1 migrations → deploy all Workers + Pages to staging
+- **`deploy-prod.yml`** (tag `v*.*.*`): requires manual approval in GitHub → D1 + PlanetScale migrations → deploy all → Pages
+
+### 24.3 Deployment Order (production)
+
+1. D1 schema migrations (backward-compatible; nullable new columns)
+2. PlanetScale Deploy Request merged
+3. Durable Object classes deployed
+4. All Workers deployed
+5. Cloudflare Pages (Web + Admin SPA)
+
+---
+
+## 25 — TESTING STRATEGY
+
+### 25.1 Pyramid
+
+| Layer | Tool | Coverage |
+|---|---|---|
+| Unit | Vitest | ≥80% line coverage on service layer |
+| Integration | Vitest + Miniflare | All P0 functional requirements |
+| E2E | Playwright | All 8 key user flows |
+| Load | k6 | 1,000 concurrent users; p95 < 300ms |
+
+### 25.2 Critical Test Cases `[P0 — all must pass before launch]`
+
+| ID | Scenario |
+|---|---|
+| T-01 | 423 returned when KV `susp:{matchId}` is set **before** any DB query executes |
+| T-02 | Concurrent bets on same wallet → correct balance, no double-deduction |
+| T-03 | Admin suspends user → all API requests return 401 within 3s |
+| T-04 | Password stored as Argon2id hash; plaintext never in DB or logs |
+| T-05 | WS odds update reaches clients within 50ms of Feed Worker receipt (staging) |
+| T-06 | Stake > `max_bet` → 400 `LIMIT_MAX_BET` |
+| T-07 | Every admin action generates audit log with correct before/after state |
+| T-08 | Wicket event → KV suspension flag set within 50ms; next bet → 423 |
+| T-09 | 6th login attempt same IP within 15min → 429 |
+| T-10 | Accumulator combined odds = product of all legs; correct payout displayed |
+| T-11 | Cashout formula: `(current/original) × stake × (1 - margin)` correct |
+| T-12 | Settlement processes 400 bets/second under load (batch=10) |
+| T-13 | Duplicate idempotencyKey within 60s → original bet returned, no duplicate in DB |
+| T-14 | Duplicate username → 409, no partial user record |
+| T-15 | Re-settlement reverses all prior settlements, re-settles correctly |
+| T-16 | Withdrawal hold prevents double-spend when concurrent bet placed |
+
+### 25.3 Miniflare Integration Test Pattern
+
+```typescript
+// FILE: tests/integration/betPlacement.test.ts
+// CODEX: T-01 critical path. Seed susp:match-1 in KV before dispatch. Expect 423.
+// CODEX: Seed sess:test-token and odds:match-1:market-1 in beforeEach.
+import { Miniflare } from "miniflare"
+
+describe("Bet Placement Pipeline", () => {
+  let mf: Miniflare
+
+  beforeEach(async () => {
+    mf = new Miniflare({
+      modules: true,
+      scriptPath: "workers/api/src/worker.ts",
+      kvNamespaces: ["SESSIONS","SUSPENDED_MARKETS","ODDS_CACHE","MARKET_LIABILITY","RATE_LIMITS"],
+      durableObjects: { BETTING_SLIP_DO: "BettingSlipDurableObject" },
+      bindings: { INTERNAL_SECRET: "test-secret" },
+    })
+    const kv = await mf.getKVNamespace("SESSIONS")
+    await kv.put("sess:test-token", JSON.stringify({
+      userId: "test-user-1", username: "sensei", balance: 10000
+    }))
+    const oddsKv = await mf.getKVNamespace("ODDS_CACHE")
+    await oddsKv.put("odds:match-1:market-1", JSON.stringify({
+      selections: [{ id: "sel-1", odds: 2.5 }]
+    }))
+  })
+
+  it("T-01: rejects bet when market is suspended", async () => {
+    const suspKv = await mf.getKVNamespace("SUSPENDED_MARKETS")
+    await suspKv.put("susp:match-1", "1")
+
+    const response = await mf.dispatchFetch("https://api.worldgaming.eu.org/api/bets", {
+      method: "POST",
+      headers: { Cookie: "sess_token=test-token", "Content-Type": "application/json" },
+      body: JSON.stringify({
+        selections: [{ matchId: "match-1", marketId: "market-1", selectionId: "sel-1", odds: 2.5 }],
+        stake: 500,
+        idempotencyKey: crypto.randomUUID(),
+        betType: "single",
+      }),
+    })
+
+    expect(response.status).toBe(423)
+    const body = await response.json()
+    expect(body.error.code).toBe("MARKET_SUSPENDED")
+  })
+})
+```
+
+---
+
+## 26 — SCALABILITY CONSIDERATIONS
+
+- **WebSocket sharding (>100k connections):** `match:{matchId}:shard{n}` — Feed Worker broadcasts to all shards. Phase 1 uses single-shard per match.
+- **PlanetScale throughput:** `transactions` is INSERT-only (maximises write throughput); `wallets` uses row-level `FOR UPDATE`; HTTP driver handles connection pooling.
+- **D1 ceiling (~100 writes/s):** All audit/odds-history writes are async via queue. No financial data in D1.
+- **KV at peak (1,000 bets/min):** `MARKET_LIABILITY` ~1,000 writes/min; `SESSIONS` ~10,000 writes/min — within KV limits.
+
+---
+
+## 27 — FAILURE RECOVERY
+
+| Failure | Detection | Recovery |
+|---|---|---|
+| PlanetScale down during bet | DB connection throws | Return 500; BettingSlipDO lock released; idempotency key allows retry |
+| PlanetScale down during settlement | Worker catches | Queue retry 3× (30s/60s/120s); DLQ after 3 failures; Telegram alert |
+| KV unavailable | KV read throws | Fail closed — reject the bet. Never assume market is open on KV error |
+| MatchDO cold start | Constructor fires | `blockConcurrencyWhile` restores matchState from DO storage |
+| Feed Worker / external API down | No response > 60s | Sentry alert; auto-suspend all live markets for affected sport |
+| SportMonks webhook failure | Expected webhook not received | Polling fallback at 30s interval |
+| Settlement DLQ overflow | DLQ depth > 100 | PagerDuty critical; manual DLQ processing by Super Admin |
+| R2 audit write failure | Audit Worker exception | Retry 5×; D1 remains source of truth |
+| Worker deploy failure | Wrangler non-zero exit | GitHub Actions fails; Wrangler preserves last-deployed version automatically |
+
+---
+
+## 28 — EDGE CASE HANDLING
+
+| Scenario | Handling |
+|---|---|
+| Odds change > 5% during live bet delay | Return `ODDS_CHANGED`; user must re-confirm before DB write |
+| User places bet then immediately suspends market | KV suspension check is first step; bet rejected even if DB write started |
+| Accumulator with one voided leg | Entire accumulator voided; full stake refunded |
+| Re-settlement after admin error | All affected bets voided (stake refunded), then re-evaluated against corrected result; full audit trail |
+| Withdrawal requested on same funds as open bet | `available_balance = balance - pending_withdrawal - SUM(open_bets.stake)` prevents double-spend |
+| Admin creates user with same username (race) | UNIQUE constraint on `users.username`; returns 409 `DUPLICATE_USERNAME` |
+| Feed delivers duplicate event | SHA-256 fingerprint + 300s KV dedup prevents duplicate DO updates |
+| MatchDO alarm fires but match already reopened | `SUSPENDED_MARKETS.delete` is idempotent; no-op if key absent |
+| BettingSlipDO lock expires mid-delay | 60s TTL exceeds 3s delay; lock always valid during delay window |
+| Admin IP changes mid-session | `SESSION_IP_MISMATCH` → session deleted → redirect to admin login |
+
+---
+
+## 29 — CODEX GENERATION CHECKLIST
+
+> Use this checklist to verify every generated file before committing.
+
+### Pre-Bet-Placement (P0 — every `betsRouter.ts` must satisfy all)
+- [ ] `SUSPENDED_MARKETS.get("susp:${matchId}", { cacheTtl: 0 })` called before any DB query
+- [ ] `BettingSlipDO.acquireLock(idempotencyKey)` called before wallet debit
+- [ ] `walletService.debit()` is the only path writing to `wallets`
+- [ ] `transactions` INSERT is inside the same PS transaction as `wallets` UPDATE
+- [ ] `fraud-analysis-queue.send()` called after COMMIT, never before
+- [ ] Response is `201 { betId, status: "accepted" }` — never include raw balance
+
+### Auth (P0 — every middleware must satisfy all)
+- [ ] All KV session reads use `{ cacheTtl: 0 }`
+- [ ] Cookie: `HttpOnly; Secure; SameSite=Strict`
+- [ ] Admin IP hash check on every `/sgyt/*` request
+- [ ] `user_sessions:{userId}` index updated on every session creation
+
+### Wallet (P0 — every mutation must satisfy all)
+- [ ] `SELECT ... FOR UPDATE` before every `UPDATE wallets`
+- [ ] `balance_before` and `balance_after` on every `transactions` INSERT
+- [ ] `transactions` table: INSERT paths only — no UPDATE or DELETE generated
+- [ ] Withdrawal hold set atomically with request creation
+
+### Audit (P0 — every admin route must satisfy all)
+- [ ] `auditService.logAction()` called with before + after snapshots
+- [ ] D1 write awaited before response
+- [ ] Queue publish not awaited
+
+### Security (P0)
+- [ ] No secrets in `wrangler.toml`
+- [ ] No raw `c.req.json()` — all through `@hono/zod-validator`
+- [ ] No `console.error` — `Sentry.captureException()` only
+- [ ] CORS origin: `https://worldgaming.eu.org` only
